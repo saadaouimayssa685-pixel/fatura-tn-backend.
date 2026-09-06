@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# Node / Next.js
+node_modules/
+.next/
+out/
+tsconfig.tsbuildinfo
+
+# Local secrets
+.env
+backend/.env
+frontend/.env*.local
+
+# Runtime data
+data/
+*.sqlite*
+*.db
+*.zip
+.env.*
+!.env.example
+*.pem
+*.key
+
+# OS
+.DS_Store
+Thumbs.db

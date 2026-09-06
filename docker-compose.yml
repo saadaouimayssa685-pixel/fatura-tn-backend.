@@ -1,0 +1,86 @@
+version: '3.8'
+
+services:
+  invoice-ocr-api:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    image: invoice-ocr-api:local
+    container_name: invoice-ocr-backend
+    ports:
+      - "8002:8002"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - DATABASE_URL=postgresql://invoice_user:invoice_password@postgres:5432/invoice_rag_os
+      - UPLOAD_FOLDER=/app/data/uploads
+      - INVOICE_STORAGE_FOLDER=/app/data/invoice_storage/documents
+      - DOCUMENT_STORAGE_FOLDER=/app/data/document_ai/documents
+      - RAG_STORAGE_FOLDER=/app/data/rag_storage/documents
+      - YOLO_MODEL_PATH=/app/models/extraction/best.pt
+      - TESSDATA_DIR=/app/backend/tessdata
+      - MAX_FILE_SIZE=10485760
+      - ALLOWED_EXTENSIONS=png,jpg,jpeg,tiff,bmp,webp,pdf
+      - ALLOWED_ORIGINS=http://localhost:3000,http://127.0.0.1:3000
+      - HOME=/home/appuser
+      - PADDLEX_HOME=/home/appuser/.paddlex
+      - PADDLEOCR_HOME=/home/appuser/.paddleocr
+    volumes:
+      - ./data:/app/data
+      - ./models:/app/models:ro
+      - ./assets:/app/assets:ro
+      # Mount PaddleOCR cache directory for persistence
+      - paddleocr_cache:/home/appuser/.paddlex
+      - paddleocr_models:/home/appuser/.paddleocr
+    restart: unless-stopped
+    networks:
+      - invoice-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8002/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # Optional: Redis for caching (uncomment if needed)
+  # redis:
+  #   image: redis:7-alpine
+  #   container_name: invoice-redis
+  #   ports:
+  #     - "6379:6379"
+  #   volumes:
+  #     - redis_data:/data
+  #   restart: unless-stopped
+  #   networks:
+  #     - invoice-network
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: invoice-postgres
+    environment:
+      POSTGRES_DB: invoice_rag_os
+      POSTGRES_USER: invoice_user
+      POSTGRES_PASSWORD: invoice_password
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    restart: unless-stopped
+    networks:
+      - invoice-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U invoice_user -d invoice_rag_os"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+networks:
+  invoice-network:
+    driver: bridge
+
+volumes:
+  paddleocr_cache:
+  paddleocr_models:
+  postgres_data:

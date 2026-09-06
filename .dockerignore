@@ -1,0 +1,11 @@
+.git
+**/.env
+**/.env.*
+!**/.env.example
+data
+frontend
+*.zip
+**/__pycache__
+**/*.pyc
+**/node_modules
+**/.venv
