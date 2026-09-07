@@ -53,7 +53,7 @@ class GeminiCloud:
         finally:
             self._lock.release()
 
-    def analyze_invoice_text(self, extracted_text, field_evidence=None):
+    def analyze_invoice_text(self, extracted_text, field_evidence=None, rule_candidates=None):
         if len(extracted_text) > 50000:
             raise RuntimeError("Document trop long pour cette configuration Gemini.")
         field_evidence = field_evidence or {}
@@ -78,9 +78,13 @@ class GeminiCloud:
             "into products. Tunisian amounts have three millimes: 24,800 means JSON 24.8; 1 853,130 means 1853.13; "
             "12.600 means 12.6. A comma followed by three digits is decimal, not thousands. Never multiply values by 1000. "
             "Use additional_data only for stamp_duty, amount_in_words and discount when directly visible. "
+            "The supplied rule_candidates are a closed list produced by regex, dictionaries and table checks. "
+            "Select an exact candidate only when OCR/RAG proves it; never create another value, calculate an amount "
+            "or add a line item. Return null or [] when a candidate is not proven. "
             "Do not assign a confidence score. Return only the invoice JSON object.",
             {
                 "schema": InvoiceData.model_json_schema(),
+                "rule_candidates": rule_candidates or {},
                 "rag_evidence_by_field": evidence_bundle,
                 "ocr_text": extracted_text,
             },

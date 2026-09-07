@@ -14,7 +14,9 @@ class OllamaInvoiceAnalyzer:
     def __init__(self):
         self.base_url = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
         self.model_name = os.getenv("OLLAMA_INVOICE_MODEL", "phi3.5")
-        self.timeout = int(os.getenv("OLLAMA_TIMEOUT_SECONDS", "120"))
+        # A local model is an optional decision step. It must not freeze the
+        # invoice workflow when the host is busy or a model is unloaded.
+        self.timeout = int(os.getenv("OLLAMA_TIMEOUT_SECONDS", "45"))
 
     def is_available(self) -> bool:
         try:
@@ -32,8 +34,9 @@ class OllamaInvoiceAnalyzer:
         self,
         extracted_text: str,
         field_evidence: Optional[Dict[str, List[Dict[str, Any]]]] = None,
+        rule_candidates: Optional[Dict[str, Any]] = None,
     ) -> Optional[InvoiceData]:
-        prompt = self._build_prompt(extracted_text, field_evidence)
+        prompt = self._build_prompt(extracted_text, field_evidence, rule_candidates)
 
         try:
             response = requests.post(
@@ -64,6 +67,7 @@ class OllamaInvoiceAnalyzer:
         self,
         extracted_text: str,
         field_evidence: Optional[Dict[str, List[Dict[str, Any]]]] = None,
+        rule_candidates: Optional[Dict[str, Any]] = None,
     ) -> str:
         schema = {
             "invoice_number": None,
@@ -91,8 +95,8 @@ class OllamaInvoiceAnalyzer:
         }
         evidence_bundle = {
             field: [
-                {"page": chunk.get("page_number"), "passage": chunk.get("text", "")[:900]}
-                for chunk in chunks[:2]
+                {"page": chunk.get("page_number"), "passage": chunk.get("text", "")[:450]}
+                for chunk in chunks[:1]
             ]
             for field, chunks in (field_evidence or {}).items()
             if chunks
@@ -106,10 +110,14 @@ class OllamaInvoiceAnalyzer:
             "ils restent des chaines telles qu'elles apparaissent. Les lignes doivent provenir uniquement du tableau "
             "des articles, jamais des en-tetes, adresses ni totaux. En Tunisie, une virgule suivie de trois chiffres "
             "est decimale : 24,800 = 24.8 et 1 853,130 = 1853.13. Ne multiplie jamais un montant par 1000. "
-            "Les preuves RAG par champ sont prioritaires sur le texte OCR integral.\n\n"
+            "Les preuves RAG par champ sont prioritaires sur le texte OCR integral. Les CANDIDATS REGLES sont une "
+            "liste fermee construite par regex, dictionnaires et controles de tableau: tu peux reprendre exactement "
+            "une valeur de cette liste seulement si elle est confirmee par les preuves; tu ne peux jamais creer une "
+            "nouvelle valeur, faire un calcul, ni ajouter une ligne. Si un candidat est ambigu, retourne null.\n\n"
             f"Schema:\n{json.dumps(schema, ensure_ascii=False)}\n\n"
+            f"Candidats regles (liste fermee):\n{json.dumps(rule_candidates or {}, ensure_ascii=False)}\n\n"
             f"Preuves RAG par champ:\n{json.dumps(evidence_bundle, ensure_ascii=False)}\n\n"
-            f"Texte OCR/PDF:\n{extracted_text[:12000]}"
+            f"Texte OCR/PDF:\n{extracted_text[:5000]}"
         )
 
     def answer_sources(self, question: str, sources: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -131,7 +139,7 @@ class OllamaInvoiceAnalyzer:
             f"Question: {question[:2000]}\n\n"
             "Sources:\n"
             + "\n\n".join(
-                f"[Source {index + 1}]\n{source.get('text', '')[:3500]}"
+                f"[Source {index + 1}]\n{source.get('text', '')[:1200]}"
                 for index, source in enumerate(sources[:5])
             )
         )

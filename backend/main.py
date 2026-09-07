@@ -27,6 +27,7 @@ from pdf_extractor import PDFExtractor
 from rag import RAGService
 from ollama_analyzer import OllamaInvoiceAnalyzer
 from gemini_cloud import GeminiCloud
+from invoice_rules import extract_invoice_table_text, filter_invoice_line_items
 from dotenv import load_dotenv
 
 
@@ -64,6 +65,8 @@ DEFAULT_ALLOWED_ORIGINS = [
     "http://0.0.0.0:5173",
     "http://localhost:5174",
     "http://127.0.0.1:5174",
+    "http://localhost:5175",
+    "http://127.0.0.1:5175",
 ]
 ALLOWED_ORIGINS = sorted(set(
     DEFAULT_ALLOWED_ORIGINS
@@ -527,65 +530,74 @@ def normalize_money_amount(value, fallback_value=0.0):
 
     return amount
 
-def normalize_invoice_data(invoice_data: Optional[InvoiceData], extracted_text: str):
+def normalize_invoice_data(
+    invoice_data: Optional[InvoiceData],
+    extracted_text: str,
+    rule_candidates: Optional[Dict[str, Any]] = None,
+):
     """Convertit InvoiceData interne vers le format plat exploitable par la saisie."""
-    fallback, _ = extract_invoice_fields_rag_assisted(extracted_text)
+    fallback = (rule_candidates or {}).get("fields") or extract_invoice_fields_rag_assisted(extracted_text)[0]
     invoice_data = invoice_data or InvoiceData()
 
-    invoice_number = str(invoice_data.invoice_number or "").strip()
     fallback_invoice_number = str(fallback.get("invoice_number", "") or "").strip()
-    if invoice_number.upper() in {"A", "S", "SS"} or len(invoice_number) < 3:
-        invoice_number = fallback_invoice_number
+    invoice_number = fallback_invoice_number if len(fallback_invoice_number) >= 3 else str(invoice_data.invoice_number or "").strip()
+    if invoice_number.upper() in {"A", "S", "SS"}:
+        invoice_number = ""
 
-    items = []
-    for item in invoice_data.items or []:
-        items.append({
-            "description": item.description or item.designation or "",
-            "quantity": safe_float(item.quantity) or 1,
-            "unit_price": safe_float(item.unit_price),
-            "total": safe_float(item.total_price),
-        })
+    def candidate_text(key: str, model_value: Any) -> str:
+        candidate = str(fallback.get(key, "") or "").strip()
+        return candidate or str(model_value or "").strip()
+
+    def candidate_money(key: str, model_value: Any) -> Optional[float]:
+        candidate = safe_float(fallback.get(key))
+        if candidate > 0:
+            return candidate
+        amount = normalize_money_amount(model_value, 0.0)
+        return amount if amount > 0 else None
+
+    # Candidate rows are produced by OCR table rules.  Do not expose raw LLM
+    # rows: a model may be useful for deciding fields, never for inventing rows.
+    if rule_candidates is not None:
+        items = list(rule_candidates.get("items") or [])
+    else:
+        items = list(fallback.get("items") or [])
 
     normalized = {
         "invoice_number": invoice_number,
-        "date": invoice_data.invoice_date or fallback.get("date", ""),
+        "date": candidate_text("date", invoice_data.invoice_date),
         "due_date": invoice_data.due_date or "",
-        "vendor_name": invoice_data.supplier.name if invoice_data.supplier and invoice_data.supplier.name else fallback.get("vendor_name", ""),
+        "vendor_name": candidate_text("vendor_name", invoice_data.supplier.name if invoice_data.supplier else ""),
         "vendor_address": invoice_data.supplier.address if invoice_data.supplier and invoice_data.supplier.address else "",
         "vendor_tax_id": (
-            invoice_data.supplier.vat_number
+            candidate_text("vendor_tax_id", invoice_data.supplier.vat_number)
             if invoice_data.supplier and invoice_data.supplier.vat_number
-            else invoice_data.supplier.registration_number
-            if invoice_data.supplier and invoice_data.supplier.registration_number
-            else fallback.get("vendor_tax_id", "")
+            else candidate_text("vendor_tax_id", invoice_data.supplier.registration_number if invoice_data.supplier else "")
         ),
         "tax_id": (
-            invoice_data.supplier.vat_number
+            candidate_text("vendor_tax_id", invoice_data.supplier.vat_number)
             if invoice_data.supplier and invoice_data.supplier.vat_number
-            else invoice_data.supplier.registration_number
-            if invoice_data.supplier and invoice_data.supplier.registration_number
-            else fallback.get("vendor_tax_id", "")
+            else candidate_text("vendor_tax_id", invoice_data.supplier.registration_number if invoice_data.supplier else "")
         ),
-        "vendor_phone": invoice_data.supplier.phone if invoice_data.supplier and invoice_data.supplier.phone else fallback.get("vendor_phone", ""),
-        "customer_name": invoice_data.customer.name if invoice_data.customer and invoice_data.customer.name else fallback.get("customer_name", ""),
+        "vendor_phone": candidate_text("vendor_phone", invoice_data.supplier.phone if invoice_data.supplier else ""),
+        "customer_name": candidate_text("customer_name", invoice_data.customer.name if invoice_data.customer else ""),
         "customer_address": invoice_data.customer.address if invoice_data.customer and invoice_data.customer.address else "",
         "customer_tax_id": (
-            invoice_data.customer.vat_number
+            candidate_text("customer_tax_id", invoice_data.customer.vat_number)
             if invoice_data.customer and invoice_data.customer.vat_number
-            else fallback.get("customer_tax_id", "")
+            else candidate_text("customer_tax_id", "")
         ),
-        "customer_phone": invoice_data.customer.phone if invoice_data.customer and invoice_data.customer.phone else fallback.get("customer_phone", ""),
-        "subtotal": normalize_money_amount(invoice_data.subtotal, fallback.get("subtotal", 0.0)) or fallback.get("subtotal", 0.0),
-        "tax_amount": normalize_money_amount(invoice_data.tax_amount, fallback.get("tax_amount", 0.0)) or fallback.get("tax_amount", 0.0),
+        "customer_phone": candidate_text("customer_phone", invoice_data.customer.phone if invoice_data.customer else ""),
+        "subtotal": candidate_money("subtotal", invoice_data.subtotal),
+        "tax_amount": candidate_money("tax_amount", invoice_data.tax_amount),
         "tax_rate": fallback.get("tax_rate", ""),
-        "stamp_duty": fallback.get("stamp_duty", 0.0),
-        "total_amount": normalize_money_amount(invoice_data.total_amount, fallback.get("total_amount", 0.0)) or fallback.get("total_amount", 0.0),
+        "stamp_duty": candidate_money("stamp_duty", None),
+        "total_amount": candidate_money("total_amount", invoice_data.total_amount),
         "currency": invoice_data.currency or fallback.get("currency") or "TND",
         "payment_method": fallback.get("payment_method", ""),
         "rib": fallback.get("rib", ""),
         "amount_in_words": getattr(invoice_data, "amount_in_words", "") or fallback.get("amount_in_words", ""),
         "notes": getattr(invoice_data, "notes", "") or fallback.get("notes", "") or fallback.get("amount_in_words", ""),
-        "items": items or fallback.get("items", []),
+        "items": items,
     }
     return normalized
 
@@ -641,9 +653,10 @@ def enforce_evidence_guard(
     normalized_fields: Dict[str, Any],
     extracted_text: str,
     field_evidence: Optional[Dict[str, Any]] = None,
+    rule_candidates: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """Reject LLM/fallback values that cannot be found in OCR and return auditable proofs."""
-    fallback = extract_invoice_fields_fallback(extracted_text)
+    fallback = (rule_candidates or {}).get("fields") or extract_invoice_fields_fallback(extracted_text)
     guarded = dict(normalized_fields)
     proofs: Dict[str, Any] = {}
 
@@ -662,7 +675,7 @@ def enforce_evidence_guard(
                 value = fallback_value
                 supported = True
             else:
-                guarded[field_name] = 0.0 if field_name in {"subtotal", "tax_amount", "stamp_duty", "total_amount"} else ""
+                guarded[field_name] = None if field_name in {"subtotal", "tax_amount", "stamp_duty", "total_amount"} else ""
                 value = guarded[field_name]
         matching_chunk = next(
             (
@@ -682,14 +695,25 @@ def enforce_evidence_guard(
             } if matching_chunk else ("ocr_text" if supported else None)),
         }
 
-    verified_items = []
-    for item in guarded.get("items", []):
-        designation = str(item.get("description") or "").strip()
-        tokens = [token for token in re.findall(r"[a-z0-9]{3,}", designation.lower())]
-        if tokens and all(token in _canonical_identifier(extracted_text) for token in tokens):
-            verified_items.append(item)
+    table_text = extract_invoice_table_text(extracted_text)
+    proposed_items = (
+        list((rule_candidates or {}).get("items") or [])
+        if rule_candidates is not None
+        else list(guarded.get("items") or [])
+    )
+    verified_items, rejected_items = filter_invoice_line_items(
+        proposed_items,
+        table_text,
+        guarded.get("total_amount"),
+    )
     guarded["items"] = verified_items
-    proofs["items"] = {"value": len(verified_items), "supported": bool(verified_items), "source": "ocr_text" if verified_items else None}
+    proofs["items"] = {
+        "value": len(verified_items),
+        "supported": bool(verified_items),
+        "source": "ocr_table_rules" if verified_items else None,
+        "table_detected": bool(table_text),
+        "rejected": rejected_items,
+    }
     return guarded, proofs
 
 
@@ -811,20 +835,19 @@ def extract_invoice_line_items_from_text(text: str) -> List[Dict[str, Any]]:
     ressemblent a un tableau article/quantite/prix/total, et ignore les totaux
     de bas de page pour ne pas inventer des articles.
     """
-    table_start = re.search(r"\b(?:code\s+article|designation|désignation|quantite|quantité|pu\s*ht|prix\s+unitaire)\b", text, flags=re.IGNORECASE)
-    if not table_start:
+    table_text = extract_invoice_table_text(text)
+    if not table_text:
         table_start = re.search(r"\b(?:commande\s+client|bon\s+de\s+livraison\s+client)\b", text, flags=re.IGNORECASE)
-    if not table_start:
+        table_text = text[table_start.start():] if table_start else ""
+    if not table_text:
         return []
-
-    table_text = text[table_start.start():]
     table_end = re.search(r"\b(?:base\s+tva|total\s+tva|total\s+ttc|droit\s+de\s+timbre|arretee\s+la\s+presente)\b", table_text, flags=re.IGNORECASE)
     if table_end:
         table_text = table_text[: table_end.start()]
 
     columnar_items = extract_columnar_invoice_items(table_text)
-    if len(columnar_items) >= 4:
-        return columnar_items
+    if columnar_items:
+        return filter_invoice_line_items(columnar_items, table_text)[0]
 
     items: List[Dict[str, Any]] = []
     header_terms = {
@@ -900,27 +923,38 @@ def extract_invoice_line_items_from_text(text: str) -> List[Dict[str, Any]]:
         if any(term in description.lower() for term in meta_terms):
             continue
 
-        numbers = [match.group(0) for match in number_matches]
-        quantity = "1"
-        for number in numbers[:-2] or numbers[:1]:
-            if re.fullmatch(r"\d{1,4}", number.strip()):
-                quantity = number.strip()
-                break
-
-        unit_price = safe_float(numbers[-2]) if len(numbers) >= 2 else safe_float(numbers[-1])
-        total = safe_float(numbers[-1])
-        if total > 0 and unit_price > 0 and total > unit_price * 20 and re.fullmatch(r"\d{2,4}", numbers[-1].strip()):
-            total = unit_price
-        if total <= 0:
+        parsed_numbers = [(match, safe_float(match.group(0))) for match in number_matches]
+        if len(parsed_numbers) < 2:
             continue
 
-        if unit_price <= 0 and quantity and safe_float(quantity) > 0:
-            unit_price = total / safe_float(quantity)
+        # Read monetary columns from the right. Product references such as
+        # `N6/5` occur before the actual quantity and must never win this tie.
+        total = parsed_numbers[-1][1]
+        possible_tax_rate = parsed_numbers[-2][1]
+        has_tax_rate_column = possible_tax_rate in {1.0, 5.0, 7.0, 13.0, 19.0}
+        unit_price_index = -3 if has_tax_rate_column and len(parsed_numbers) >= 3 else -2
+        unit_price = parsed_numbers[unit_price_index][1]
+        quantity_candidates = parsed_numbers[:unit_price_index]
+        quantity = 1.0
+        quantity_match = None
+        for candidate_match, candidate in reversed(quantity_candidates):
+            if 0 < candidate <= 10000:
+                quantity = candidate
+                quantity_match = candidate_match
+                break
+        if total <= 0 or unit_price <= 0:
+            continue
+        if quantity_match is not None:
+            description = line[:quantity_match.start()].strip(" -:|")
+        elif unit_price_index < 0:
+            description = line[:parsed_numbers[unit_price_index][0].start()].strip(" -:|")
+        if len(description) < 3 or not re.search(r"[A-Za-zÀ-ÿ]{3,}", description):
+            continue
 
         items.append(
             {
                 "description": description[:180],
-                "quantity": safe_float(quantity) or 1,
+                "quantity": quantity,
                 "unit_price": unit_price,
                 "total": total,
                 "confidence": 0.62 if len(number_matches) >= 3 else 0.52,
@@ -942,7 +976,7 @@ def extract_invoice_line_items_from_text(text: str) -> List[Dict[str, Any]]:
         seen.add(key)
         deduped.append(item)
 
-    return deduped[:30]
+    return filter_invoice_line_items(deduped, table_text)[0]
 
 
 def extract_columnar_invoice_items(table_text: str) -> List[Dict[str, Any]]:
@@ -963,6 +997,33 @@ def extract_columnar_invoice_items(table_text: str) -> List[Dict[str, Any]]:
     inline_items: List[Dict[str, Any]] = []
     pending_descriptions: List[str] = []
     standalone_amounts: List[float] = []
+
+    # Tesseract often returns a vertical table as one OCR cell per line.  A
+    # reference followed by designation, quantity, unit price and line amount
+    # is much stronger evidence than pairing arbitrary text with later digits.
+    reference_pattern = r"(?:[A-Z]{1,4}-)?\d{4,}(?:[-/]\d+){0,3}"
+    money_pattern = r"\d+(?:[ .]\d{3})*(?:[,.]\d{1,3})?"
+    vertical_row_pattern = re.compile(
+        rf"^\s*{reference_pattern}\s*$\s*"
+        rf"^\s*(?P<description>[A-Za-zÀ-ÿ][^\r\n]{{2,180}})\s*$\s*"
+        rf"^\s*(?P<quantity>\d+(?:[,.]\d+)?)\s*$\s*"
+        rf"^\s*(?P<unit_price>{money_pattern})\s*$\s*"
+        rf"^\s*(?P<total>{money_pattern})\s*$",
+        flags=re.IGNORECASE | re.MULTILINE,
+    )
+    vertical_items = [
+        {
+            "description": match.group("description").strip(),
+            "quantity": safe_float(match.group("quantity")),
+            "unit_price": safe_float(match.group("unit_price")),
+            "total": safe_float(match.group("total")),
+            "confidence": 0.84,
+            "source": "ocr_vertical_table",
+        }
+        for match in vertical_row_pattern.finditer(table_text)
+    ]
+    if vertical_items:
+        return vertical_items
 
     for raw_line in re.split(r"[\n\r]+", table_text):
         line = re.sub(r"\s+", " ", raw_line).strip(" |;:")
@@ -1194,7 +1255,7 @@ def extract_party_hints(text: str) -> Dict[str, str]:
             hints["customer_name"] = value[:120]
             break
     customer_tax_match = re.search(
-        r"(?:Nom\s+du\s+Client|Client|Raison\s+Sociale?).{0,220}?\b(?:MF|TVA)\s*:\s*([0-9A-Z/\s]{6,30})",
+        r"(?:Nom\s+du\s+Client|Client|Raison\s+Sociale?).{0,220}?\b(?:MF|TVA)\s*:\s*(\d{5,8}\s*[A-Z]?(?:\s*/\s*[A-Z0-9]{1,3}){1,4})",
         text,
         flags=re.IGNORECASE | re.DOTALL,
     )
@@ -1515,7 +1576,7 @@ def extract_invoice_fields_fallback(text: str):
         data["customer_tax_id"] = tax_ids["customer_tax_id"]
     if data["customer_tax_id"] and data["customer_tax_id"] == data["vendor_tax_id"]:
         duplicate_customer_tax = re.search(
-            r"(?:Nom\s+du\s+Client|Client|Raison\s+Sociale?).{0,220}?\b(?:MF|TVA)\s*:\s*([0-9A-Z/\s]{6,30})",
+            r"(?:Nom\s+du\s+Client|Client|Raison\s+Sociale?).{0,220}?\b(?:MF|TVA)\s*:\s*(\d{5,8}\s*[A-Z]?(?:\s*/\s*[A-Z0-9]{1,3}){1,4})",
             text,
             flags=re.IGNORECASE | re.DOTALL,
         )
@@ -1532,6 +1593,40 @@ def extract_invoice_fields_fallback(text: str):
     data["notes"] = data["amount_in_words"]
 
     return data
+
+
+def build_rule_candidate_pack(extracted_text: str) -> Dict[str, Any]:
+    """Build bounded OCR candidates before asking a model to resolve fields.
+
+    Each candidate comes from a labelled regex/dictionary rule or an article
+    table row that passed arithmetic and location checks. The LLM sees this
+    package but cannot invent a new monetary value or product row.
+    """
+    fields = extract_invoice_fields_fallback(extracted_text)
+    table_text = extract_invoice_table_text(extracted_text)
+    accepted_items, rejected_items = filter_invoice_line_items(
+        fields.get("items") or [],
+        table_text,
+        fields.get("total_amount"),
+    )
+    fields = dict(fields)
+    fields["items"] = accepted_items
+    field_values = {
+        field_name: value
+        for field_name, value in fields.items()
+        if field_has_value(field_name, value)
+    }
+    return {
+        "fields": fields,
+        "llm_candidates": {
+            "field_values": field_values,
+            "article_rows": accepted_items,
+            "article_table_detected": bool(table_text),
+            "rejected_article_rows": rejected_items,
+        },
+        "items": accepted_items,
+        "rejected_items": rejected_items,
+    }
 
 async def save_upload_file(upload_file: UploadFile) -> str:
     """Sauvegarde le fichier téléchargé et retourne le chemin"""
@@ -1586,6 +1681,7 @@ def analyze_invoice_fields(
     extracted_text: str,
     model_choice: str,
     field_evidence: Optional[Dict[str, Any]] = None,
+    rule_candidates: Optional[Dict[str, Any]] = None,
 ) -> tuple[Optional[InvoiceData], str, Dict[str, Any]]:
     """Analyse les champs de facture avec le modele choisi puis fallback regex."""
     invoice_data = None
@@ -1594,7 +1690,11 @@ def analyze_invoice_fields(
 
     try:
         if model_choice == "local":
-            invoice_data = ollama_analyzer.analyze_invoice_text(extracted_text, field_evidence=field_evidence)
+            invoice_data = ollama_analyzer.analyze_invoice_text(
+                extracted_text,
+                field_evidence=field_evidence,
+                rule_candidates=(rule_candidates or {}).get("llm_candidates"),
+            )
             model_used = f"ollama:{ollama_analyzer.model_name}" if invoice_data else "fallback_regex"
         elif model_choice == "gemma":
             invoice_data = get_gemma_analyzer().analyze_document(extracted_text)
@@ -1602,7 +1702,11 @@ def analyze_invoice_fields(
         elif model_choice == "fallback":
             model_used = "fallback_regex"
         else:
-            invoice_data = ai_analyzer.analyze_invoice_text(extracted_text, field_evidence=field_evidence)
+            invoice_data = ai_analyzer.analyze_invoice_text(
+                extracted_text,
+                field_evidence=field_evidence,
+                rule_candidates=(rule_candidates or {}).get("llm_candidates"),
+            )
             model_used = "gemini" if ai_analyzer.model else "fallback_regex"
     except Exception as analysis_error:
         print(f"Analyse IA indisponible, fallback regex: {analysis_error}")
@@ -1754,6 +1858,42 @@ def validate_normalized_invoice_fields(
     tax_amount = safe_float(normalized_fields.get("tax_amount"))
     stamp_duty = safe_float(normalized_fields.get("stamp_duty"))
     total_amount = safe_float(normalized_fields.get("total_amount"))
+    items = list(normalized_fields.get("items") or [])
+    if total_amount > 0 and subtotal <= 0:
+        issues.append(
+            {
+                "code": "missing_subtotal_for_total",
+                "severity": "blocking",
+                "message": "TTC was found, but no OCR-proven HT amount was found. Do not infer it from TTC.",
+            }
+        )
+    if subtotal > 0 and tax_amount <= 0:
+        issues.append(
+            {
+                "code": "tax_amount_not_detected",
+                "severity": "warning",
+                "message": "HT is available but no OCR-proven TVA amount was found.",
+            }
+        )
+    if total_amount > 0 and (field_proofs or {}).get("items", {}).get("table_detected") and not items:
+        issues.append(
+            {
+                "code": "no_verified_line_items",
+                "severity": "blocking",
+                "message": "An article table was detected but no row passed the OCR structure and arithmetic rules.",
+            }
+        )
+    if items and total_amount > 0:
+        items_total = sum(safe_float(item.get("total")) for item in items)
+        if items_total > total_amount + AGENT_POLICY["math_tolerance_tnd"]:
+            issues.append(
+                {
+                    "code": "line_items_exceed_total",
+                    "severity": "blocking",
+                    "message": "The verified item lines exceed TTC; the document requires human review.",
+                    "metadata": {"items_total": round(items_total, 3), "total_amount": total_amount},
+                }
+            )
     if subtotal > 0 and total_amount > 0:
         expected_total = subtotal + tax_amount + stamp_duty
         delta = abs(expected_total - total_amount)
@@ -1991,6 +2131,7 @@ async def run_document_agent(
         analysis_raw: Dict[str, Any] = {}
         field_evidence: Dict[str, Any] = {}
         field_proofs: Dict[str, Any] = {}
+        rule_candidates: Dict[str, Any] = {}
         validation_issues: List[Dict[str, Any]] = []
         selected_model_choice = model_choice or "local"
 
@@ -2008,6 +2149,19 @@ async def run_document_agent(
                         for field_name, chunks in field_evidence.items()
                         if chunks
                     ],
+                },
+            )
+            rule_candidates = build_rule_candidate_pack(extracted_text)
+            add_agent_decision(
+                agent_decisions,
+                step="deterministic_candidates",
+                decision="build_regex_dictionary_and_table_candidates",
+                reason="Regex, label dictionaries and article-table arithmetic produced a bounded candidate set before the LLM call.",
+                action="continue_to_llm_decision",
+                metadata={
+                    "candidate_fields": sorted(rule_candidates.get("llm_candidates", {}).get("field_values", {}).keys()),
+                    "verified_article_rows": len(rule_candidates.get("items") or []),
+                    "rejected_article_rows": rule_candidates.get("rejected_items") or [],
                 },
             )
 
@@ -2038,7 +2192,7 @@ async def run_document_agent(
             )
 
             invoice_data, model_used, analysis_raw = await run_in_threadpool(
-                analyze_invoice_fields, extracted_text, selected_model_choice, field_evidence
+                analyze_invoice_fields, extracted_text, selected_model_choice, field_evidence, rule_candidates
             )
             add_agent_decision(
                 agent_decisions,
@@ -2049,9 +2203,9 @@ async def run_document_agent(
                 metadata={"requested_model": model_choice, "selected_model": selected_model_choice, "model_used": model_used},
             )
 
-            normalized_fields = normalize_invoice_data(invoice_data, extracted_text)
+            normalized_fields = normalize_invoice_data(invoice_data, extracted_text, rule_candidates)
             normalized_fields, field_proofs = enforce_evidence_guard(
-                normalized_fields, extracted_text, field_evidence
+                normalized_fields, extracted_text, field_evidence, rule_candidates
             )
             missing_fields = missing_required_invoice_fields(normalized_fields)
             validation_issues = validate_normalized_invoice_fields(normalized_fields, field_proofs)
@@ -2095,6 +2249,8 @@ async def run_document_agent(
                     "object_detections": detections,
                     "field_evidence": field_evidence,
                     "field_proofs": field_proofs,
+                    "rule_candidates": rule_candidates.get("llm_candidates", {}),
+                    "rejected_article_rows": rule_candidates.get("rejected_items", []),
                     "agent_decisions": agent_decisions,
                     "agent_actions": agent_actions,
                     "agent_policy": AGENT_POLICY,
