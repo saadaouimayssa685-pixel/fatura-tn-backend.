@@ -580,7 +580,7 @@ def normalize_invoice_data(invoice_data: Optional[InvoiceData], extracted_text: 
         "tax_rate": fallback.get("tax_rate", ""),
         "stamp_duty": fallback.get("stamp_duty", 0.0),
         "total_amount": normalize_money_amount(invoice_data.total_amount, fallback.get("total_amount", 0.0)) or fallback.get("total_amount", 0.0),
-        "currency": invoice_data.currency or fallback.get("currency", "TND"),
+        "currency": invoice_data.currency or fallback.get("currency") or "TND",
         "payment_method": fallback.get("payment_method", ""),
         "rib": fallback.get("rib", ""),
         "amount_in_words": getattr(invoice_data, "amount_in_words", "") or fallback.get("amount_in_words", ""),
@@ -650,6 +650,11 @@ def enforce_evidence_guard(
     for field_name in EVIDENCE_GUARDED_FIELDS:
         value = guarded.get(field_name)
         supported = value_has_ocr_support(field_name, value, extracted_text)
+        # A missing currency marker on a Tunisian invoice is common. Keep the
+        # explicit workflow default while recording that it is not OCR-derived.
+        workflow_default_currency = field_name == "currency" and str(value or "").upper() == "TND"
+        if workflow_default_currency:
+            supported = True
         if not supported:
             fallback_value = fallback.get(field_name, "")
             if value_has_ocr_support(field_name, fallback_value, extracted_text):
@@ -669,12 +674,12 @@ def enforce_evidence_guard(
         proofs[field_name] = {
             "value": value,
             "supported": supported,
-            "source": {
+            "source": "workflow_default_tnd" if workflow_default_currency else ({
                 "type": "rag_chunk",
                 "chunk_index": matching_chunk.get("chunk_index"),
                 "page_number": matching_chunk.get("page_number"),
                 "preview": matching_chunk.get("preview"),
-            } if matching_chunk else ("ocr_text" if supported else None),
+            } if matching_chunk else ("ocr_text" if supported else None)),
         }
 
     verified_items = []
@@ -817,6 +822,10 @@ def extract_invoice_line_items_from_text(text: str) -> List[Dict[str, Any]]:
     if table_end:
         table_text = table_text[: table_end.start()]
 
+    columnar_items = extract_columnar_invoice_items(table_text)
+    if len(columnar_items) >= 4:
+        return columnar_items
+
     items: List[Dict[str, Any]] = []
     header_terms = {
         "code",
@@ -934,6 +943,76 @@ def extract_invoice_line_items_from_text(text: str) -> List[Dict[str, Any]]:
         deduped.append(item)
 
     return deduped[:30]
+
+
+def extract_columnar_invoice_items(table_text: str) -> List[Dict[str, Any]]:
+    """Reconciles OCR tables whose labels and amount columns are separate.
+
+    Some scans are read column by column: the OCR returns several descriptions,
+    then their right-hand amount column. We only activate this conservative path
+    when at least four descriptions and a matching monetary sequence exist.
+    """
+    # Do not treat the space between two adjacent OCR cells as a thousands
+    # separator; otherwise `1.400.000 1400.000` becomes one corrupted amount.
+    amount_pattern = r"(?:\d+(?:\.\d{3})+|\d+(?:,\d{3})+)"
+    header_or_summary = re.compile(
+        r"\b(?:code|article|designation|désignation|quantite|quantité|prix|unitaire|montant|"
+        r"total|tva|timbre|net\s*(?:à|a)?\s*payer|client|vendeur|facture|date|page)\b",
+        flags=re.IGNORECASE,
+    )
+    inline_items: List[Dict[str, Any]] = []
+    pending_descriptions: List[str] = []
+    standalone_amounts: List[float] = []
+
+    for raw_line in re.split(r"[\n\r]+", table_text):
+        line = re.sub(r"\s+", " ", raw_line).strip(" |;:")
+        if not line or header_or_summary.search(line):
+            continue
+        if re.fullmatch(amount_pattern, line):
+            amount = safe_float(line)
+            if amount > 0:
+                standalone_amounts.append(amount)
+            continue
+
+        matches = list(re.finditer(amount_pattern, line))
+        letters = re.search(r"[A-Za-zÀ-ÿ]{3,}", line)
+        if not letters:
+            continue
+        if matches:
+            description = line[: matches[0].start()].strip(" -:=|")
+            if len(description) < 3:
+                continue
+            amounts = [safe_float(match.group(0)) for match in matches]
+            total = amounts[-1]
+            if total <= 0:
+                continue
+            inline_items.append({
+                "description": description[:180],
+                "quantity": 1,
+                "unit_price": amounts[-2] if len(amounts) > 1 else total,
+                "total": total,
+                "confidence": 0.72,
+                "source": "ocr_columnar_table",
+            })
+        else:
+            pending_descriptions.append(line[:180])
+
+    if len(inline_items) < 2 or len(pending_descriptions) < 2 or len(standalone_amounts) < len(pending_descriptions):
+        return []
+
+    # OCR often repeats the monetary column. The first complete sequence is the
+    # source order corresponding to the pending descriptions.
+    reconciled = [*inline_items]
+    for description, amount in zip(pending_descriptions, standalone_amounts):
+        reconciled.append({
+            "description": description,
+            "quantity": 1,
+            "unit_price": amount,
+            "total": amount,
+            "confidence": 0.68,
+            "source": "ocr_columnar_table",
+        })
+    return reconciled
 
 
 def extract_amount_in_words(text: str) -> str:
@@ -1515,7 +1594,7 @@ def analyze_invoice_fields(
 
     try:
         if model_choice == "local":
-            invoice_data = ollama_analyzer.analyze_invoice_text(extracted_text)
+            invoice_data = ollama_analyzer.analyze_invoice_text(extracted_text, field_evidence=field_evidence)
             model_used = f"ollama:{ollama_analyzer.model_name}" if invoice_data else "fallback_regex"
         elif model_choice == "gemma":
             invoice_data = get_gemma_analyzer().analyze_document(extracted_text)
@@ -3896,7 +3975,14 @@ async def rag_query(request: RAGQueryRequest):
             top_k=request.top_k,
         )
         result["generation"] = {"status": "unavailable", "model": None}
-        if ai_analyzer.model and result["sources"]:
+        if result["sources"] and ollama_analyzer.is_available():
+            try:
+                generated = await run_in_threadpool(ollama_analyzer.answer_sources, request.question, result["sources"])
+                result.update(generated)
+                result["generation"] = {"status": "completed", "model": f"ollama:{ollama_analyzer.model_name}"}
+            except RuntimeError as error:
+                result["generation"] = {"status": "failed", "message": str(error), "model": f"ollama:{ollama_analyzer.model_name}"}
+        elif ai_analyzer.model and result["sources"]:
             try:
                 generated = await run_in_threadpool(ai_analyzer.answer_sources, request.question, result["sources"])
                 result.update(generated)
