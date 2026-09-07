@@ -61,6 +61,7 @@ class OptimizedOCRExtractor:
         height, width = image.shape[:2]
         if image.ndim == 3:
             image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        source_image = image.copy()
 
         # Full-page OCR is too slow on the Render Free 0.1 CPU plan. Invoices
         # put identity and references in the header, while the article table
@@ -165,11 +166,18 @@ class OptimizedOCRExtractor:
         fast_psm = os.getenv("OCR_FAST_PSM", "4").strip() or "4"
         fast_config = re.sub(r"--psm\s+\d+", f"--psm {fast_psm}", self.ocr_config)
         fast_config = re.sub(r"-l\s+\S+", f"-l {fast_language}", fast_config)
-        data = pytesseract.image_to_data(
-            Image.fromarray(image), config=fast_config,
-            output_type=pytesseract.Output.DICT,
-            timeout=max(10, int(os.getenv("OCR_TESSERACT_TIMEOUT", "40"))),
-        )
+        try:
+            data = pytesseract.image_to_data(
+                Image.fromarray(image), config=fast_config,
+                output_type=pytesseract.Output.DICT,
+                timeout=max(10, int(os.getenv("OCR_TESSERACT_TIMEOUT", "40"))),
+            )
+        except RuntimeError as error:
+            # A single, compact canvas can still exceed the wall-clock limit
+            # on Render Free. Retry with small, meaningful crops instead of
+            # failing the invoice request or returning invented fields.
+            print(f"Fast OCR canvas timed out, using focused crop fallback: {error}")
+            return self._extract_focused_regions(source_image, fast_config)
         lines = {}
         confidences = []
         for index, word in enumerate(data["text"]):
@@ -182,6 +190,46 @@ class OptimizedOCRExtractor:
                 confidences.append(confidence)
         return ("\n".join(" ".join(words) for words in lines.values()),
                 sum(confidences) / len(confidences) / 100 if confidences else 0.0)
+
+    def _extract_focused_regions(self, image):
+        """OCR small invoice regions separately after a hosted timeout."""
+        height, width = image.shape[:2]
+        regions = [
+            # The vendor MF is usually small but crisp in the top-left block;
+            # do not rely on the less reliable duplicate found in the footer.
+            (image[round(height * 0.02):round(height * 0.22), :round(width * 0.55)], 1100),
+            (image[round(height * 0.12):round(height * 0.34), round(width * 0.38):], 900),
+            (image[round(height * 0.30):round(height * 0.58), :], 900),
+            (image[round(height * 0.54):round(height * 0.78), :], 900),
+            (image[round(height * 0.82):, :], 900),
+        ]
+        config = re.sub(r"--psm\s+\d+", "--psm 6", self.ocr_config)
+        fast_language = os.getenv("OCR_FAST_LANGUAGE", "eng").strip() or "eng"
+        config = re.sub(r"-l\s+\S+", f"-l {fast_language}", config)
+        if "-l " not in config:
+            config = f"-l {fast_language} {config}"
+
+        texts = []
+        timeout = max(10, int(os.getenv("OCR_FOCUSED_REGION_TIMEOUT", "20")))
+        for region, target_width in regions:
+            if region.size == 0:
+                continue
+            scale = min(target_width / region.shape[1], 1.0)
+            if scale < 1.0:
+                region = cv2.resize(region, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+            _, region = cv2.threshold(region, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            try:
+                text = pytesseract.image_to_string(
+                    Image.fromarray(region), config=config, timeout=timeout
+                ).strip()
+            except RuntimeError as error:
+                print(f"Focused OCR region timed out: {error}")
+                continue
+            if text:
+                texts.append(text)
+
+        text = "\n".join(texts)
+        return text, 0.55 if text else 0.0
 
     def extract_full_text_from_array(self, image_array) -> Dict:
         try:

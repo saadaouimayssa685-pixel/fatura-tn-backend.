@@ -37,6 +37,18 @@ class FastOCRTests(unittest.TestCase):
         canvas = np.array(extract.call_args.args[0])
         self.assertLessEqual(max(canvas.shape), 3000)
 
+    @patch("ocr_extractor.pytesseract.image_to_string", return_value="FACTURE QA-1")
+    def test_timeout_uses_small_focused_regions(self, extract):
+        instance = OptimizedOCRExtractor.__new__(OptimizedOCRExtractor)
+        instance.ocr_config = "--psm 4 -l fra+eng"
+        text, confidence = instance._extract_focused_regions(np.zeros((1654, 2338), dtype=np.uint8))
+
+        self.assertEqual(text.count("FACTURE QA-1"), 5)
+        self.assertEqual(confidence, 0.55)
+        self.assertEqual(extract.call_count, 5)
+        self.assertEqual(extract.call_args.kwargs["timeout"], 20)
+        self.assertIn("--psm 6", extract.call_args.kwargs["config"])
+
 
 if __name__ == "__main__":
     unittest.main()

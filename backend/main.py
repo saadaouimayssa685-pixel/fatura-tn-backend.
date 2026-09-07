@@ -1018,7 +1018,7 @@ def extract_columnar_invoice_items(table_text: str) -> List[Dict[str, Any]]:
     # Tesseract often returns a vertical table as one OCR cell per line.  A
     # reference followed by designation, quantity, unit price and line amount
     # is much stronger evidence than pairing arbitrary text with later digits.
-    reference_pattern = r"(?:[A-Z0-9]{1,4}-)?\d{4,}(?:[-/]\d+){0,3}"
+    reference_pattern = r"(?:[A-Z0-9]{1,4}-)?\d{4,}[A-Za-z]?(?:[-/]\d{3,}[A-Za-z]?){0,3}"
     money_pattern = r"\d+(?:[ .]\d{3})*(?:[,.]\d{1,3})?"
     vertical_row_pattern = re.compile(
         rf"^\s*{reference_pattern}\s*$\s*"
@@ -1059,7 +1059,9 @@ def extract_columnar_invoice_items(table_text: str) -> List[Dict[str, Any]]:
         if matches:
             description = line[: matches[0].start()].strip(" -:=|")
             description = re.sub(r"\s*\|\s*", " ", description)
+            description = re.sub(r"^[^A-Za-zÀ-ÿ0-9]+", "", description)
             description = re.sub(rf"^(?:{reference_pattern})\s*", "", description, flags=re.IGNORECASE)
+            description = re.sub(r"^[^A-Za-zÀ-ÿ0-9]+", "", description)
             # The OCR cell immediately before a monetary column is usually
             # quantity; it belongs to the numeric columns, not the label.
             description = re.sub(r"\s+\d+(?:[,.]\d+)?$", "", description).strip()
@@ -1331,7 +1333,16 @@ def extract_party_hints(text: str) -> Dict[str, str]:
                 break
 
     if tax_ids:
-        if hints["customer_name"] and re.search(r"Raison\s+Sociale?", text, flags=re.IGNORECASE) and len(tax_ids) >= 2:
+        if hints["customer_tax_id"] and len(tax_ids) >= 2:
+            # The customer block is frequently scanned before a supplier
+            # footer. Once its MF is proven by proximity to "Client", the
+            # other distinct identifier belongs to the supplier.
+            vendor_candidates = [value for value in tax_ids if value != hints["customer_tax_id"]]
+            # Prefer the first non-client occurrence: it is normally the
+            # header identifier, whereas later footer/cachet copies are often
+            # lower-quality OCR duplicates.
+            hints["vendor_tax_id"] = vendor_candidates[0] if vendor_candidates else ""
+        elif hints["customer_name"] and re.search(r"Raison\s+Sociale?", text, flags=re.IGNORECASE) and len(tax_ids) >= 2:
             hints["customer_tax_id"] = tax_ids[0]
             hints["vendor_tax_id"] = tax_ids[-1]
         elif re.search(r"\bB\.?\s*L\.?\s*-\s*Facture\b", text, flags=re.IGNORECASE) and len(tax_ids) >= 2:

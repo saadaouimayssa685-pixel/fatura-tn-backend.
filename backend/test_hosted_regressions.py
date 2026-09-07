@@ -56,6 +56,45 @@ TOTAL TTC 5534.100"""
         self.assertEqual(scope["extract_phone_near_labels"](text, ["client"]), "")
         self.assertEqual(scope["extract_phone_near_labels"]("Tel: 22 629 288", ["fournisseur"]), "22 629 288")
 
+    def test_client_and_vendor_tax_ids_remain_distinct(self):
+        tree = ast.parse(Path("main.py").read_text(encoding="utf-8-sig"))
+        names = {"clean_tax_identifier", "extract_party_hints"}
+        module = ast.Module(
+            body=[node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in names],
+            type_ignores=[],
+        )
+        scope = {"re": re, "Dict": dict}
+        exec(compile(module, "main.py", "exec"), scope)
+
+        text = """BEN ABDELKADER
+Nom du Client : BRIDGE IMMOBILERE
+MF : 1362434/S
+Adresse fournisseur
+MF : 1547376 Z/N/C/000"""
+        hints = scope["extract_party_hints"](text)
+
+        self.assertEqual(hints["customer_tax_id"], "1362434/S")
+        self.assertEqual(hints["vendor_tax_id"], "1547376Z/N/C/000")
+
+    def test_ocr_reference_artifact_does_not_hide_a_line_item(self):
+        tree = ast.parse(Path("main.py").read_text(encoding="utf-8-sig"))
+        names = {"safe_float", "extract_columnar_invoice_items"}
+        module = ast.Module(
+            body=[node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in names],
+            type_ignores=[],
+        )
+        scope = {"re": re, "List": List, "Dict": dict, "Any": object}
+        exec(compile(module, "main.py", "exec"), scope)
+
+        items = scope["extract_columnar_invoice_items"](
+            "Référence Désignation Qte PU TTC Montant\n"
+            "[A-002018-00076a {Rouleau Antigoutte Cristal 1 6.000 6.000\n"
+            ")A-002016-002754 | Pinceau rond N6/5 SAP 1 6.000 6.000"
+        )
+
+        self.assertEqual(len(items), 2)
+        self.assertEqual(items[0]["description"], "Rouleau Antigoutte Cristal")
+
     def test_search_is_parameterized_and_bounded(self):
         store = PostgresInvoiceStore.__new__(PostgresInvoiceStore)
         connection, cursor = MagicMock(), MagicMock()
