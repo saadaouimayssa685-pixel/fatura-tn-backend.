@@ -64,8 +64,11 @@ class OptimizedOCRExtractor:
             image = cv2.resize(image, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
         if image.ndim == 3:
             image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        # Suppress faint reverse-side printing before segmenting the full page.
+        _, image = cv2.threshold(image, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        config = self.ocr_config.replace("--psm 6", "--psm 3")
         data = pytesseract.image_to_data(
-            Image.fromarray(image), config=self.ocr_config,
+            Image.fromarray(image), config=config,
             output_type=pytesseract.Output.DICT, timeout=90,
         )
         lines = {}

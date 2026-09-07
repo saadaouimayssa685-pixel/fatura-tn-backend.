@@ -20,6 +20,8 @@ class FastOCRTests(unittest.TestCase):
         self.assertEqual(confidence, 0.9)
         self.assertEqual(extract.call_count, 1)
         self.assertEqual(extract.call_args.kwargs["timeout"], 90)
+        self.assertEqual(extract.call_args.kwargs["config"], "--psm 3")
+        self.assertTrue(set(np.unique(np.array(extract.call_args.args[0]))) <= {0, 255})
 
 
 if __name__ == "__main__":
