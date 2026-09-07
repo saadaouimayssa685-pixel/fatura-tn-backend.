@@ -1692,7 +1692,8 @@ async def run_document_agent(
             metadata={"filename": filename, "file_type": file_type, "size_bytes": len(content)},
         )
 
-        extracted_text, extraction_confidence, extraction_metadata = extract_document_text(file_path)
+        from starlette.concurrency import run_in_threadpool
+        extracted_text, extraction_confidence, extraction_metadata = await run_in_threadpool(extract_document_text, file_path)
         text_strategy = extraction_metadata.get("method_used", "unknown")
         add_agent_decision(
             agent_decisions,

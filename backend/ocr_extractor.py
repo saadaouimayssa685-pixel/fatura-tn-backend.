@@ -21,6 +21,7 @@ class OptimizedOCRExtractor:
         self.base_ocr_config = f"-l fra+eng --tessdata-dir {self.tessdata_dir}"
         self.ocr_config = f"--psm 6 {self.base_ocr_config}"
         self._configure_tesseract()
+        self.fast_mode = os.getenv("OCR_FAST_MODE", "false").lower() == "true"
 
     def _configure_tesseract(self):
         common_windows_path = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
@@ -49,13 +50,44 @@ class OptimizedOCRExtractor:
         if image is None:
             return "", 0.0
 
+        if self.fast_mode:
+            return self._fast_extract(image)
+
         variants = self._build_preprocessing_variants(image)
         return self._run_tesseract_best(variants)
+
+    def _fast_extract(self, image):
+        height, width = image.shape[:2]
+        if max(height, width) > 2200:
+            scale = 2200 / max(height, width)
+            image = cv2.resize(image, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+        if image.ndim == 3:
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        data = pytesseract.image_to_data(
+            Image.fromarray(image), config=self.ocr_config,
+            output_type=pytesseract.Output.DICT, timeout=90,
+        )
+        lines = {}
+        confidences = []
+        for index, word in enumerate(data["text"]):
+            if not word.strip():
+                continue
+            key = tuple(data[field][index] for field in ("page_num", "block_num", "par_num", "line_num"))
+            lines.setdefault(key, []).append(word)
+            confidence = float(data["conf"][index])
+            if confidence >= 0:
+                confidences.append(confidence)
+        return ("\n".join(" ".join(words) for words in lines.values()),
+                sum(confidences) / len(confidences) / 100 if confidences else 0.0)
 
     def extract_full_text_from_array(self, image_array) -> Dict:
         try:
             if image_array is None or image_array.size == 0:
                 return {"text": "", "confidence": 0.0}
+
+            if self.fast_mode:
+                text, confidence = self._fast_extract(image_array)
+                return {"text": text, "confidence": confidence}
 
             variants = self._build_preprocessing_variants(image_array)
             text, confidence = self._run_tesseract_best(variants)
