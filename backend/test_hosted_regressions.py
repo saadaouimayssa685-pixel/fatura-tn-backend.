@@ -1,10 +1,13 @@
 import ast
+import json
 import re
 import unittest
+from decimal import Decimal
 from pathlib import Path
 from typing import List
 from unittest.mock import MagicMock
 from postgres_invoice_store import PostgresInvoiceStore
+from postgres_invoice_store import json_dumps
 
 
 class RegressionTests(unittest.TestCase):
@@ -109,6 +112,10 @@ MF : 1547376 Z/N/C/000"""
         sql, params = cursor.execute.call_args.args
         self.assertNotIn("' OR 1=1", sql)
         self.assertEqual(params[0], "%' OR 1=1 --%")
+
+    def test_postgres_decimal_audit_payload_is_json_safe(self):
+        payload = json.loads(json_dumps({"total": Decimal("12.600")}))
+        self.assertEqual(payload["total"], 12.6)
 
 
 if __name__ == "__main__":

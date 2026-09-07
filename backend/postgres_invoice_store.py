@@ -1,7 +1,17 @@
 import json
 import os
+from decimal import Decimal
 from postgres_file_store import PostgresFileStore
 from typing import Any, Dict, List, Optional
+
+
+def json_dumps(value: Any) -> str:
+    """Serialize PostgreSQL values safely before writing JSONB audit payloads."""
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        default=lambda item: float(item) if isinstance(item, Decimal) else str(item),
+    )
 
 
 class PostgresInvoiceStore:
@@ -146,8 +156,8 @@ class PostgresInvoiceStore:
                         file_type,
                         stored_path,
                         extracted_text,
-                        json.dumps(normalized_data, ensure_ascii=False),
-                        json.dumps(enriched_raw_data, ensure_ascii=False),
+                        json_dumps(normalized_data),
+                        json_dumps(enriched_raw_data),
                         model_used,
                         confidence_score,
                     ),
@@ -168,7 +178,7 @@ class PostgresInvoiceStore:
                     SET normalized_json = %s::jsonb, status = %s, updated_at = NOW()
                     WHERE id = %s
                     """,
-                    (json.dumps(normalized_data, ensure_ascii=False), status, invoice_id),
+                    (json_dumps(normalized_data), status, invoice_id),
                 )
                 self._sync_structured_invoice(cursor, invoice_id, normalized_data)
                 self._add_validation_event(cursor, invoice_id, f"updated_{status}", before_data, normalized_data)
@@ -203,7 +213,7 @@ class PostgresInvoiceStore:
                             updated_at = NOW(), validated_at = NOW()
                         WHERE id = %s
                         """,
-                        (json.dumps(normalized_data, ensure_ascii=False), invoice_id),
+                        (json_dumps(normalized_data), invoice_id),
                     )
                     self._sync_structured_invoice(cursor, invoice_id, normalized_data)
 
@@ -548,8 +558,8 @@ class PostgresInvoiceStore:
                 invoice_id,
                 user_email,
                 action,
-                json.dumps(before_data, ensure_ascii=False),
-                json.dumps(after_data, ensure_ascii=False),
+                json_dumps(before_data),
+                json_dumps(after_data),
             ),
         )
 

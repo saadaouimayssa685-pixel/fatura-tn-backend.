@@ -1,7 +1,17 @@
 import json
 import os
+from decimal import Decimal
 from postgres_file_store import PostgresFileStore
 from typing import Any, Dict, List, Optional
+
+
+def json_dumps(value: Any) -> str:
+    """Serialize PostgreSQL decimal values in document metadata and JSONB."""
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        default=lambda item: float(item) if isinstance(item, Decimal) else str(item),
+    )
 
 
 class PostgresDocumentStore:
@@ -102,11 +112,11 @@ class PostgresDocumentStore:
                         classification_confidence,
                         extraction_confidence,
                         extracted_text,
-                        json.dumps(fields, ensure_ascii=False),
-                        json.dumps(detections, ensure_ascii=False),
-                        json.dumps(rag_document or {}, ensure_ascii=False),
+                        json_dumps(fields),
+                        json_dumps(detections),
+                        json_dumps(rag_document or {}),
                         invoice_id,
-                        json.dumps(metadata, ensure_ascii=False),
+                        json_dumps(metadata),
                         status,
                     ),
                 )
