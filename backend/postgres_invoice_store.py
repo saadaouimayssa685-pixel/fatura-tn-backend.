@@ -226,6 +226,35 @@ class PostgresInvoiceStore:
             raise ValueError(f"Invoice {invoice_id} not found")
         return self._row_to_invoice(row)
 
+    def search_invoices(self, search="", invoice_name="", supplier="", company="",
+                        tax_id="", status="", page=1, page_size=10):
+        conditions, params = [], []
+        groups = [
+            (search, ["filename", "supplier_name", "customer_name", "invoice_number", "normalized_json::text", "extracted_text"]),
+            (invoice_name, ["filename", "invoice_number"]),
+            (supplier, ["supplier_name"]),
+            (company, ["customer_name"]),
+            (tax_id, ["normalized_json->>'vendor_tax_id'", "normalized_json->>'customer_tax_id'", "normalized_json->>'tax_id'"]),
+        ]
+        for value, columns in groups:
+            if value.strip():
+                conditions.append("(" + " OR ".join(f"{column} ILIKE %s" for column in columns) + ")")
+                params.extend(["%" + value.strip() + "%"] * len(columns))
+        if status.strip():
+            conditions.append("status = %s")
+            params.append(status.strip())
+        where = " WHERE " + " AND ".join(conditions) if conditions else ""
+        page, page_size = max(1, int(page or 1)), min(100, max(1, int(page_size or 10)))
+        with self._connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT COUNT(*) AS count FROM invoices" + where, params)
+                total = int(cursor.fetchone()["count"])
+                cursor.execute("SELECT * FROM invoices" + where + " ORDER BY created_at DESC, id DESC LIMIT %s OFFSET %s",
+                               params + [page_size, (page - 1) * page_size])
+                rows = cursor.fetchall()
+        return {"items": [self._row_to_invoice(row) for row in rows], "total": total,
+                "page": page, "page_size": page_size, "total_pages": max(1, (total + page_size - 1) // page_size)}
+
     def list_suppliers(self) -> List[Dict[str, Any]]:
         with self._connect() as connection:
             with connection.cursor() as cursor:
@@ -314,7 +343,7 @@ class PostgresInvoiceStore:
                     """
                     SELECT id, invoice_number, supplier_name, customer_name, due_date, invoice_date, total_amount, currency, status
                     FROM invoices
-                    WHERE COALESCE(due_date, invoice_date, '') <> ''
+                    WHERE COALESCE(due_date, '') <> ''
                     ORDER BY COALESCE(due_date, invoice_date) ASC
                     LIMIT 8
                     """
@@ -341,7 +370,6 @@ class PostgresInvoiceStore:
         supplier_name = (
             self._as_text(normalized_data.get("vendor_name"))
             or self._as_text(normalized_data.get("supplier_name"))
-            or self._as_text(normalized_data.get("customer_name"))
             or "Inconnu"
         )
         supplier_id = self._upsert_supplier(

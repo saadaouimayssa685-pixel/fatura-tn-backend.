@@ -969,7 +969,7 @@ def extract_invoice_number(text: str) -> str:
     for pattern in patterns:
         for match in re.finditer(pattern, text or "", flags=re.IGNORECASE):
             value = match.group(1).strip(" .:-|")
-            if value and value.upper() not in {"S", "SS", "A"}:
+            if value and any(char.isdigit() for char in value):
                 return value[:80]
     return ""
 
@@ -1078,7 +1078,7 @@ def clean_phone_number(value: str) -> str:
     cleaned = re.sub(r"[^\d+]", " ", value or "")
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
     digits = re.sub(r"\D", "", cleaned)
-    if len(digits) < 6:
+    if len(digits) not in {8, 11}:
         return ""
     return cleaned[:40]
 
@@ -1087,11 +1087,10 @@ def extract_phone_near_labels(text: str, labels: List[str], fallback_index: int 
     if not text:
         return ""
 
-    phone_pattern = r"(?:\+?\d[\d\s().\-]{5,}\d)"
+    phone_pattern = r"(?:\+?\d[\d ().\-]{5,}\d)"
     label_pattern = "|".join(re.escape(label) for label in labels)
-    for match in re.finditer(rf"(?:{label_pattern}).{{0,260}}?{phone_pattern}", text, flags=re.IGNORECASE | re.DOTALL):
-        phone_match = re.search(phone_pattern, match.group(0))
-        phone = clean_phone_number(phone_match.group(0) if phone_match else "")
+    for match in re.finditer(rf"(?:{label_pattern})[^\n]{{0,100}}?(?:t[ée]l(?:[ée]phone)?|phone|gsm|mobile)\s*[:\-]?\s*({phone_pattern})", text, flags=re.IGNORECASE):
+        phone = clean_phone_number(match.group(1))
         if phone:
             return phone
 
