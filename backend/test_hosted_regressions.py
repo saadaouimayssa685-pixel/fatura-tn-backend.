@@ -2,6 +2,7 @@ import ast
 import json
 import re
 import unittest
+from datetime import date
 from decimal import Decimal
 from pathlib import Path
 from typing import List
@@ -59,6 +60,18 @@ TOTAL TTC 5534.100"""
         self.assertEqual(scope["extract_phone_near_labels"](text, ["client"]), "")
         self.assertEqual(scope["extract_phone_near_labels"]("Tel: 22 629 288", ["fournisseur"]), "22 629 288")
 
+    def test_invalid_ocr_date_is_rejected_before_a_valid_date(self):
+        tree = ast.parse(Path("main.py").read_text(encoding="utf-8-sig"))
+        target = next(
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "extract_invoice_date"
+        )
+        scope = {"re": re, "date": date}
+        exec(compile(ast.Module(body=[target], type_ignores=[]), "main.py", "exec"), scope)
+
+        text = "Date : 20-14-2019\nDate facture : 28-11-2019"
+        self.assertEqual(scope["extract_invoice_date"](text), "28-11-2019")
+
     def test_client_and_vendor_tax_ids_remain_distinct(self):
         tree = ast.parse(Path("main.py").read_text(encoding="utf-8-sig"))
         names = {"clean_tax_identifier", "extract_party_hints"}
@@ -97,6 +110,13 @@ MF : 1547376 Z/N/C/000"""
 
         self.assertEqual(len(items), 2)
         self.assertEqual(items[0]["description"], "Rouleau Antigoutte Cristal")
+
+        dotted_reference_items = scope["extract_columnar_invoice_items"](
+            "Référence Désignation Qte PU TTC Montant\n"
+            "A.002018-00076a {Rouleau Antigoutte Cristal 1 6.000 6.000\n"
+            "A-002016-002754 Pinceau rond N6/5 SAP 1 6.000 6.000"
+        )
+        self.assertEqual(dotted_reference_items[0]["description"], "Rouleau Antigoutte Cristal")
 
     def test_search_is_parameterized_and_bounded(self):
         store = PostgresInvoiceStore.__new__(PostgresInvoiceStore)

@@ -23,8 +23,9 @@ class FastOCRTests(unittest.TestCase):
         self.assertEqual(extract.call_args.kwargs["config"], "--psm 4")
         self.assertTrue(set(np.unique(np.array(extract.call_args.args[0]))) <= {0, 255})
 
+    @patch("ocr_extractor.pytesseract.image_to_string", return_value="")
     @patch("ocr_extractor.pytesseract.image_to_data")
-    def test_client_crop_does_not_exceed_hosted_pixel_cap(self, extract):
+    def test_client_crop_does_not_exceed_hosted_pixel_cap(self, extract, extract_header):
         extract.return_value = {
             "text": ["FACTURE"], "conf": [90], "page_num": [1],
             "block_num": [1], "par_num": [1], "line_num": [1],
@@ -36,6 +37,38 @@ class FastOCRTests(unittest.TestCase):
 
         canvas = np.array(extract.call_args.args[0])
         self.assertLessEqual(max(canvas.shape), 3000)
+
+    @patch("ocr_extractor.pytesseract.image_to_string", return_value="Date : 28-11-2019")
+    @patch("ocr_extractor.pytesseract.image_to_data")
+    def test_missing_date_gets_a_small_header_retry(self, extract_data, extract_header):
+        extract_data.return_value = {
+            "text": ["FACTURE", "00633"], "conf": [90, 90], "page_num": [1, 1],
+            "block_num": [1, 1], "par_num": [1, 1], "line_num": [1, 1],
+        }
+        instance = OptimizedOCRExtractor.__new__(OptimizedOCRExtractor)
+        instance.ocr_config = "--psm 4 -l fra+eng"
+
+        text, _ = instance._fast_extract(np.zeros((1654, 2338), dtype=np.uint8))
+
+        self.assertIn("Date : 28-11-2019", text)
+        self.assertEqual(extract_header.call_count, 1)
+        self.assertEqual(extract_header.call_args.kwargs["timeout"], 15)
+        self.assertIn("--psm 6", extract_header.call_args.kwargs["config"])
+
+    @patch("ocr_extractor.pytesseract.image_to_string", return_value="Date : 28-11-2019")
+    @patch("ocr_extractor.pytesseract.image_to_data")
+    def test_invalid_date_gets_a_small_header_retry(self, extract_data, extract_header):
+        extract_data.return_value = {
+            "text": ["Date", ":", "20-14-2019"], "conf": [90, 90, 90], "page_num": [1] * 3,
+            "block_num": [1] * 3, "par_num": [1] * 3, "line_num": [1] * 3,
+        }
+        instance = OptimizedOCRExtractor.__new__(OptimizedOCRExtractor)
+        instance.ocr_config = "--psm 4 -l fra+eng"
+
+        text, _ = instance._fast_extract(np.zeros((1654, 2338), dtype=np.uint8))
+
+        self.assertIn("Date : 28-11-2019", text)
+        self.assertEqual(extract_header.call_count, 1)
 
     @patch("ocr_extractor.pytesseract.image_to_string", return_value="FACTURE QA-1")
     def test_timeout_uses_small_focused_regions(self, extract):

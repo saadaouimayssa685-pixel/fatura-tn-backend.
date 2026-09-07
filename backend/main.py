@@ -10,6 +10,7 @@ import re
 import secrets
 import sqlite3
 import time
+from datetime import date
 from typing import Any, Dict, List, Optional, Tuple
 from pathlib import Path
 from pydantic import BaseModel, Field
@@ -1018,7 +1019,7 @@ def extract_columnar_invoice_items(table_text: str) -> List[Dict[str, Any]]:
     # Tesseract often returns a vertical table as one OCR cell per line.  A
     # reference followed by designation, quantity, unit price and line amount
     # is much stronger evidence than pairing arbitrary text with later digits.
-    reference_pattern = r"(?:[A-Z0-9]{1,4}-)?\d{4,}[A-Za-z]?(?:[-/]\d{3,}[A-Za-z]?){0,3}"
+    reference_pattern = r"(?:[A-Z0-9]{1,4}[.-])?\d{4,}[A-Za-z]?(?:[-/]\d{3,}[A-Za-z]?){0,3}"
     money_pattern = r"\d+(?:[ .]\d{3})*(?:[,.]\d{1,3})?"
     vertical_row_pattern = re.compile(
         rf"^\s*{reference_pattern}\s*$\s*"
@@ -1256,9 +1257,18 @@ def extract_invoice_date(text: str) -> str:
         r"\b([0-9]{1,2}[./-][0-9]{1,2}[./-][0-9]{2,4})\b",
     ]
     for pattern in patterns:
-        match = re.search(pattern, text or "", flags=re.IGNORECASE)
-        if match:
-            return match.group(1).replace(".", "/")
+        for match in re.finditer(pattern, text or "", flags=re.IGNORECASE):
+            value = match.group(1).replace(".", "/")
+            day, month, year = (int(part) for part in re.split(r"[-/]", value))
+            if year < 100:
+                year += 2000
+            try:
+                date(year, month, day)
+            except ValueError:
+                # A malformed OCR token such as 20-14-2019 must not become a
+                # confident invoice date. Keep looking for supported evidence.
+                continue
+            return value
     return ""
 
 

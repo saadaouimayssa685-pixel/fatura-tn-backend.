@@ -1,6 +1,7 @@
 import os
 import re
 import tempfile
+from datetime import date
 from typing import Dict, Tuple
 
 import cv2
@@ -188,8 +189,60 @@ class OptimizedOCRExtractor:
             confidence = float(data["conf"][index])
             if confidence >= 0:
                 confidences.append(confidence)
-        return ("\n".join(" ".join(words) for words in lines.values()),
-                sum(confidences) / len(confidences) / 100 if confidences else 0.0)
+        text = "\n".join(" ".join(words) for words in lines.values())
+        # The compact canvas is deliberately inexpensive, but it can merge a
+        # small date label into nearby header text. Recover only that missing
+        # primary field from its own crop instead of rerunning full-page OCR.
+        if height >= 500 and width >= 500 and not self._contains_valid_date(text):
+            date_evidence = self._extract_header_date_evidence(source_image)
+            if date_evidence:
+                text = f"{text}\n{date_evidence}"
+
+        return (text, sum(confidences) / len(confidences) / 100 if confidences else 0.0)
+
+    @staticmethod
+    def _contains_valid_date(text):
+        for match in re.finditer(r"\b(\d{1,2})[-/.](\d{1,2})[-/.](\d{2,4})\b", text or ""):
+            day, month, year = (int(part) for part in match.groups())
+            if year < 100:
+                year += 2000
+            try:
+                date(year, month, day)
+                return True
+            except ValueError:
+                continue
+        return False
+
+    def _extract_header_date_evidence(self, image):
+        """Read the invoice header date without reprocessing the full scan."""
+        height, width = image.shape[:2]
+        region = image[round(height * 0.14):round(height * 0.34), :round(width * 0.62)]
+        if region.size == 0:
+            return ""
+
+        target_width = 1200
+        largest_dimension = max(region.shape[:2])
+        # Small header type needs a modest enlargement. This narrow crop stays
+        # far cheaper than a second full scan on the free hosted worker.
+        scale = target_width / largest_dimension
+        if scale >= 1.0:
+            scale = min(1.5, max(1.35, scale))
+        if scale != 1.0:
+            region = cv2.resize(region, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+        _, region = cv2.threshold(region, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+        config = re.sub(r"--psm\s+\d+", "--psm 6", self.ocr_config)
+        fast_language = os.getenv("OCR_FAST_LANGUAGE", "eng").strip() or "eng"
+        config = re.sub(r"-l\s+\S+", f"-l {fast_language}", config)
+        try:
+            return pytesseract.image_to_string(
+                Image.fromarray(region),
+                config=config,
+                timeout=max(8, int(os.getenv("OCR_HEADER_REGION_TIMEOUT", "15"))),
+            ).strip()
+        except RuntimeError as error:
+            print(f"Header date OCR timed out: {error}")
+            return ""
 
     def _extract_focused_regions(self, image):
         """OCR small invoice regions separately after a hosted timeout."""
