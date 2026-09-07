@@ -392,12 +392,17 @@ def classify_invoice_text(text: str):
         "linkedin.com",
     ]
 
-    strong_matches = sum(1 for keyword in strong_keywords if keyword in normalized_text)
+    invoice_label_match = bool(re.search(r"\bfactu\s*re\b|\binvoice\b", normalized_text, flags=re.IGNORECASE))
+    strong_matches = sum(
+        1
+        for keyword in strong_keywords
+        if keyword != "facture" and keyword in normalized_text
+    ) + int(invoice_label_match)
     weak_matches = sum(1 for keyword in weak_keywords if keyword in normalized_text)
     negative_matches = sum(1 for keyword in negative_keywords if keyword in normalized_text)
     invoice_number_match = bool(
         re.search(
-            r"\b(?:facture|invoice)\s*(?:id|number|no|n[°o.]*)?\s*[:#-]?\s*[a-z0-9][a-z0-9\-\/]{2,}",
+            r"\b(?:factu\s*re|invoice)\s*(?:id|number|no|n[°o.]*)?\s*[:#-]?\s*[a-z0-9][a-z0-9\-\/]{2,}",
             normalized_text,
             flags=re.IGNORECASE,
         )
@@ -450,11 +455,22 @@ def classify_invoice_text(text: str):
     structure_score += 1 if party_terms >= 1 else 0
 
     has_invoice_structure = structure_score >= 4 and amount_labels >= 1
-    is_invoice = (strong_matches > 0 and has_invoice_structure and negative_matches < 3) or (weak_matches >= 4 and has_invoice_structure and negative_matches == 0)
+    # Hosted OCR can read the invoice header while missing a pale or distant
+    # totals table. A literal invoice label together with number, date and MF
+    # is still sufficient document evidence to enter extraction. It is kept
+    # deliberately narrower than the generic "bon de livraison" signal.
+    header_identity_evidence = invoice_label_match and invoice_number_match and fiscal_match and date_match
+    is_invoice = (
+        (strong_matches > 0 and has_invoice_structure and negative_matches < 3)
+        or (weak_matches >= 4 and has_invoice_structure and negative_matches == 0)
+        or (header_identity_evidence and negative_matches == 0)
+    )
 
     confidence_score = 0.0
     if is_invoice:
         confidence_score = min(0.55 + (structure_score * 0.08) + (weak_matches * 0.03), 0.97)
+        if header_identity_evidence:
+            confidence_score = max(confidence_score, 0.82)
     elif strong_matches > 0 or weak_matches > 0:
         confidence_score = max(0.2, min(0.55 + (structure_score * 0.04) - (negative_matches * 0.12), 0.68))
     else:
@@ -465,6 +481,7 @@ def classify_invoice_text(text: str):
         "weak_keyword_matches": weak_matches,
         "negative_keyword_matches": negative_matches,
         "invoice_number_match": invoice_number_match,
+        "header_identity_evidence": header_identity_evidence,
         "fiscal_match": fiscal_match,
         "amount_label_matches": amount_labels,
         "date_match": date_match,
@@ -1001,7 +1018,7 @@ def extract_columnar_invoice_items(table_text: str) -> List[Dict[str, Any]]:
     # Tesseract often returns a vertical table as one OCR cell per line.  A
     # reference followed by designation, quantity, unit price and line amount
     # is much stronger evidence than pairing arbitrary text with later digits.
-    reference_pattern = r"(?:[A-Z]{1,4}-)?\d{4,}(?:[-/]\d+){0,3}"
+    reference_pattern = r"(?:[A-Z0-9]{1,4}-)?\d{4,}(?:[-/]\d+){0,3}"
     money_pattern = r"\d+(?:[ .]\d{3})*(?:[,.]\d{1,3})?"
     vertical_row_pattern = re.compile(
         rf"^\s*{reference_pattern}\s*$\s*"
@@ -1041,6 +1058,11 @@ def extract_columnar_invoice_items(table_text: str) -> List[Dict[str, Any]]:
             continue
         if matches:
             description = line[: matches[0].start()].strip(" -:=|")
+            description = re.sub(r"\s*\|\s*", " ", description)
+            description = re.sub(rf"^(?:{reference_pattern})\s*", "", description, flags=re.IGNORECASE)
+            # The OCR cell immediately before a monetary column is usually
+            # quantity; it belongs to the numeric columns, not the label.
+            description = re.sub(r"\s+\d+(?:[,.]\d+)?$", "", description).strip()
             if len(description) < 3:
                 continue
             amounts = [safe_float(match.group(0)) for match in matches]
@@ -1058,7 +1080,11 @@ def extract_columnar_invoice_items(table_text: str) -> List[Dict[str, Any]]:
         else:
             pending_descriptions.append(line[:180])
 
-    if len(inline_items) < 2 or len(pending_descriptions) < 2 or len(standalone_amounts) < len(pending_descriptions):
+    # When a complete row is already on one OCR line, its two monetary cells
+    # are stronger evidence than attempting a second column reconciliation.
+    if len(inline_items) >= 2:
+        return inline_items
+    if len(pending_descriptions) < 2 or len(standalone_amounts) < len(pending_descriptions):
         return []
 
     # OCR often repeats the monetary column. The first complete sequence is the
@@ -1142,7 +1168,13 @@ def extract_labeled_money(text: str, labels: List[str], prefer: str = "last") ->
 
     lines = [re.sub(r"\s+", " ", line).strip(" |:;") for line in re.split(r"[\n\r]+", text)]
     label_patterns = [re.compile(label, flags=re.IGNORECASE) for label in labels]
-    amount_pattern = re.compile(r"\d+(?:[\s.]\d{3})*(?:[,.]\d{1,3})?")
+    amount_pattern = re.compile(
+        r"(?:\d{1,3}(?:[ .]\d{3})+(?:,\d{1,3})?|\d+(?:[,.]\d{1,3})?)"
+    )
+    table_header_pattern = re.compile(
+        r"\b(?:code|reference|référence|article|designation|désignation|quantit[ée]|prix|unitaire|montant)\b",
+        flags=re.IGNORECASE,
+    )
     candidates: List[float] = []
 
     for index, line in enumerate(lines):
@@ -1152,6 +1184,10 @@ def extract_labeled_money(text: str, labels: List[str], prefer: str = "last") ->
             continue
         label_match = next((pattern.search(line) for pattern in label_patterns if pattern.search(line)), None)
         if not label_match:
+            continue
+        # A column title such as "Désignation | Prix unitaire | Total HT" is
+        # evidence of a table, not evidence of the invoice subtotal.
+        if table_header_pattern.search(line):
             continue
 
         scoped_candidates: List[float] = []
@@ -1164,10 +1200,10 @@ def extract_labeled_money(text: str, labels: List[str], prefer: str = "last") ->
                 scoped_candidates.append(amount)
 
         if not scoped_candidates and index + 1 < len(lines):
-            for match in amount_pattern.finditer(lines[index + 1]):
-                if match.end() < len(lines[index + 1]) and lines[index + 1][match.end(): match.end() + 1] == "%":
-                    continue
-                amount = safe_float(match.group(0))
+            next_line = lines[index + 1]
+            next_amount = amount_pattern.fullmatch(re.sub(r"\s*(?:TND|DT)\s*$", "", next_line, flags=re.IGNORECASE))
+            if next_amount:
+                amount = safe_float(next_amount.group(0))
                 if amount > 0:
                     scoped_candidates.append(amount)
 
@@ -1200,7 +1236,7 @@ def extract_tax_rate(text: str) -> str:
 
 def extract_invoice_number(text: str) -> str:
     patterns = [
-        r"\b(?:facture|invoice)\s*(?:n[°o.]*)?\s*[:#-]?\s*([A-Z0-9][A-Z0-9\-\/]{1,})",
+        r"\b(?:factu\s*re|invoice)\s*(?:n[°o.]*)?\s*[:#-]?\s*([A-Z0-9][A-Z0-9\-\/]{1,})",
         r"\bB\.?\s*L\.?\s*-\s*Facture\s*N[°o.]?\s*([A-Z0-9\-\/]+)",
         r"\bN[°o.]\s*(?:de\s+facture)?\s*[:#-]?\s*([A-Z0-9][A-Z0-9\-\/]{2,})",
     ]
@@ -1242,22 +1278,22 @@ def extract_party_hints(text: str) -> Dict[str, str]:
     tax_ids = [clean_tax_identifier(value) for value in tax_ids if clean_tax_identifier(value)]
 
     customer_patterns = [
-        r"Raison\s+Sociale?\s*:\s*([^\n\r]{2,100})",
-        r"Nom\s+du\s+Client\s*:\s*([^\n\r]{2,100})",
-        r"\bClient\s*:\s*([^\n\r]{2,100})",
+        r"Raison\s+Sociale?\s*[:;]\s*([^\n\r]{2,100})",
+        r"Nom\s+du\s+Client\s*[:;]\s*([^\n\r]{2,100})",
+        r"\bClient\s*[:;]\s*([^\n\r]{2,100})",
         r"\bSTE\s+DE\s+PROMOTION\b([^\n\r]*)",
         r"\b(BRIDGE\s+IMMOBILI[ÈE]RE[^\n\r]{0,50})",
     ]
     for pattern in customer_patterns:
         match = re.search(pattern, text, flags=re.IGNORECASE)
         if match:
-            value = re.sub(r"\b(?:MF|TVA|ADRESSE|DATE)\b.*$", "", match.group(1), flags=re.IGNORECASE).strip(" .:-")
+            value = re.sub(r"\b(?:MF|TVA|ADRESSE|DATE)\b.*$", "", match.group(1), flags=re.IGNORECASE).strip(" .:-)")
             hints["customer_name"] = value[:120]
             break
     customer_tax_match = re.search(
-        r"(?:Nom\s+du\s+Client|Client|Raison\s+Sociale?).{0,220}?\b(?:MF|TVA)\s*:\s*(\d{5,8}\s*[A-Z]?(?:\s*/\s*[A-Z0-9]{1,3}){1,4})",
+        r"(?:Nom\s+du\s+Client|Client|Raison\s+Sociale?)\s*[:;][^\n\r]{0,160}(?:\r?\n[^\n\r]{0,160}){0,2}?\b(?:MF|TVA)\s*[:;]\s*(\d{5,8}\s*[A-Z]?(?:\s*/\s*[A-Z0-9]{1,3}){1,4})",
         text,
-        flags=re.IGNORECASE | re.DOTALL,
+        flags=re.IGNORECASE,
     )
     if customer_tax_match:
         hints["customer_tax_id"] = clean_tax_identifier(customer_tax_match.group(1))
@@ -1301,13 +1337,8 @@ def extract_party_hints(text: str) -> Dict[str, str]:
         elif re.search(r"\bB\.?\s*L\.?\s*-\s*Facture\b", text, flags=re.IGNORECASE) and len(tax_ids) >= 2:
             hints["customer_tax_id"] = tax_ids[0]
             hints["vendor_tax_id"] = tax_ids[-1]
-        elif re.search(r"Nom\s+du\s+Client|TVA\s*:", text, flags=re.IGNORECASE) and len(tax_ids) >= 2:
-            hints["vendor_tax_id"] = tax_ids[0]
-            hints["customer_tax_id"] = tax_ids[-1]
         else:
             hints["vendor_tax_id"] = tax_ids[0]
-            if len(tax_ids) > 1:
-                hints["customer_tax_id"] = tax_ids[1]
 
     return hints
 
@@ -1424,12 +1455,6 @@ def extract_tax_ids_by_party(text: str) -> Dict[str, str]:
     remaining = [candidate["value"] for candidate in unique_candidates]
     if not vendor_tax_id and remaining:
         vendor_tax_id = remaining[0]
-    if not customer_tax_id:
-        for value in remaining:
-            if value != vendor_tax_id:
-                customer_tax_id = value
-                break
-
     return {"vendor_tax_id": vendor_tax_id, "customer_tax_id": customer_tax_id}
 
 
@@ -1463,13 +1488,16 @@ def extract_invoice_fields_fallback(text: str):
         "invoice_number": r"(?:facture|invoice)\s*(?:n[°o.]*)?\s*[:#-]?\s*([A-Z0-9\-\/]+)",
         "date": r"(?:date(?:\s+facture)?|invoice date)[^\n\r0-9]{0,80}([0-9]{1,2}[-\/.][0-9]{1,2}[-\/.][0-9]{2,4})",
         "vendor_name": r"(?:fournisseur|supplier)\s*[:\-]\s*(.+)",
-        "customer_name": r"(?:client|customer|raison\s+sociale)\s*[:\-]\s*(.+)",
-        "subtotal": r"(?:sous[- ]?total(?:\s+ht)?|subtotal|total\s+ht|montant\s+ht|droits\s+et\s+taxes)\D{0,20}([0-9][0-9\s.,]*)",
-        "tax_amount": r"(?:tva|tax\s+amount)(?:\s+[0-9.,]+\s*%)?\D{0,15}([0-9][0-9\s.,]*)",
-        "stamp_duty": r"(?:timbre(?:\s+fiscal)?|stamp(?:\s+duty)?)\D{0,15}([0-9][0-9\s.,]*)",
-        "discount": r"(?:remise|discount|rabais)\D{0,15}([0-9][0-9\s.,]*)",
-        "total_amount": r"(?:total\s+ttc|montant\s+ttc|net\s+à\s+payer|net\s+a\s+payer|total amount)\D{0,20}([0-9][0-9\s.,]*)",
-        "net_payable": r"(?:net\s+à\s+payer|net\s+a\s+payer|montant\s+à\s+payer|montant\s+a\s+payer)\D{0,20}([0-9][0-9\s.,]*)",
+        "customer_name": r"(?:client|customer|raison\s+sociale)\s*[:;\-]\s*(.+)",
+        # Do not let an OCR amount consume the following table lines: ``\s``
+        # includes newlines, while a monetary token may contain only spaces or
+        # tabs within its own line.
+        "subtotal": r"(?:sous[- ]?total(?:\s+ht)?|subtotal|total\s+ht|montant\s+ht|droits\s+et\s+taxes)\D{0,20}([0-9][0-9 \t.,]*)",
+        "tax_amount": r"(?:tva|tax\s+amount)(?:\s+[0-9.,]+\s*%)?\D{0,15}([0-9][0-9 \t.,]*)",
+        "stamp_duty": r"(?:timbre(?:\s+fiscal)?|stamp(?:\s+duty)?)\D{0,15}([0-9][0-9 \t.,]*)",
+        "discount": r"(?:remise|discount|rabais)\D{0,15}([0-9][0-9 \t.,]*)",
+        "total_amount": r"(?:total\s+ttc|montant\s+ttc|net\s+à\s+payer|net\s+a\s+payer|total amount)\D{0,20}([0-9][0-9 \t.,]*)",
+        "net_payable": r"(?:net\s+à\s+payer|net\s+a\s+payer|montant\s+à\s+payer|montant\s+a\s+payer)\D{0,20}([0-9][0-9 \t.,]*)",
         "payment_method": r"(?:mode\s+paiement|payment method)\s*[:\-]\s*(.+)",
         "rib": r"(?:rib|iban)\s*[:\-]?\s*([A-Z0-9 ]+)",
     }

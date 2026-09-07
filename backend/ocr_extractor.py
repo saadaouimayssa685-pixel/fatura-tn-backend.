@@ -63,24 +63,54 @@ class OptimizedOCRExtractor:
             image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
         # Full-page OCR is too slow on the Render Free 0.1 CPU plan. Invoices
-        # put the legal identity and reference in the header, and totals in the
-        # footer. Combining just those regions preserves the fields needed for
-        # classification and validation in a single Tesseract process.
-        def prepare_region(region):
-            max_dimension = max(700, int(os.getenv("OCR_FAST_REGION_MAX_DIMENSION", "1000")))
-            if max(region.shape[:2]) > max_dimension:
-                scale = max_dimension / max(region.shape[:2])
+        # put identity and references in the header, while the article table
+        # and totals occupy the centre. The focused client block preserves a
+        # tax identifier that is often too small in the full-width header.
+        # Combining these evidence regions
+        # keeps a single Tesseract process while preserving the fields needed
+        # for classification, line extraction and validation.
+        def prepare_region(region, upscale_to=0):
+            max_dimension = max(700, int(os.getenv("OCR_FAST_REGION_MAX_DIMENSION", "1200")))
+            largest_dimension = max(region.shape[:2])
+            if upscale_to and largest_dimension < upscale_to:
+                scale = upscale_to / largest_dimension
+                region = cv2.resize(region, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+            elif largest_dimension > max_dimension:
+                scale = max_dimension / largest_dimension
                 region = cv2.resize(region, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
             _, region = cv2.threshold(region, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
             return region
 
         if height >= 500 and width >= 500:
             header = prepare_region(image[: max(1, round(height * 0.31)), :])
+            customer_identity = prepare_region(
+                image[round(height * 0.13):round(height * 0.32), round(width * 0.42):],
+                upscale_to=1200,
+            )
+            # Keep the complete centre, not only its right totals column: the
+            # left side carries article descriptions needed to prove rows.
+            table_and_totals = prepare_region(image[round(height * 0.30):round(height * 0.76), :])
             footer = prepare_region(image[round(height * 0.72):, :])
-            canvas_width = max(header.shape[1], footer.shape[1])
-            image = np.full((header.shape[0] + footer.shape[0] + 60, canvas_width), 255, dtype=np.uint8)
+            canvas_width = max(
+                header.shape[1], customer_identity.shape[1], table_and_totals.shape[1], footer.shape[1]
+            )
+            image = np.full(
+                (
+                    header.shape[0] + customer_identity.shape[0] + table_and_totals.shape[0]
+                    + footer.shape[0] + 180,
+                    canvas_width,
+                ),
+                255,
+                dtype=np.uint8,
+            )
             image[:header.shape[0], :header.shape[1]] = header
-            footer_y = header.shape[0] + 60
+            customer_y = header.shape[0] + 60
+            image[
+                customer_y:customer_y + customer_identity.shape[0], :customer_identity.shape[1]
+            ] = customer_identity
+            table_y = customer_y + customer_identity.shape[0] + 60
+            image[table_y:table_y + table_and_totals.shape[0], :table_and_totals.shape[1]] = table_and_totals
+            footer_y = table_y + table_and_totals.shape[0] + 60
             image[footer_y:footer_y + footer.shape[0], :footer.shape[1]] = footer
         else:
             image = prepare_region(image)
@@ -88,7 +118,12 @@ class OptimizedOCRExtractor:
         # English alone is much lighter on the 0.1 CPU hosted profile and is
         # sufficient for Latin invoice labels, references and TND totals.
         fast_language = os.getenv("OCR_FAST_LANGUAGE", "eng").strip() or "eng"
-        fast_config = re.sub(r"-l\s+\S+", f"-l {fast_language}", self.ocr_config)
+        # PSM 4 preserves the separated rows of a totals block better than
+        # the compact page mode used for a full scan. Operators can still
+        # override it for a particular deployment without a code change.
+        fast_psm = os.getenv("OCR_FAST_PSM", "4").strip() or "4"
+        fast_config = re.sub(r"--psm\s+\d+", f"--psm {fast_psm}", self.ocr_config)
+        fast_config = re.sub(r"-l\s+\S+", f"-l {fast_language}", fast_config)
         data = pytesseract.image_to_data(
             Image.fromarray(image), config=fast_config,
             output_type=pytesseract.Output.DICT,
