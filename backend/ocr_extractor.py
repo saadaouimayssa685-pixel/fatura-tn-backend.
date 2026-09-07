@@ -58,9 +58,9 @@ class OptimizedOCRExtractor:
 
     def _fast_extract(self, image):
         height, width = image.shape[:2]
-        # 0.1 CPU free instances need a bounded image size; 1000px keeps
-        # invoice headers, tables and totals readable without timing out.
-        max_dimension = max(800, int(os.getenv("OCR_MAX_DIMENSION", "1000")))
+        # Render Free provides only 0.1 CPU. At 800px, headers, table labels
+        # and totals remain usable while Tesseract finishes before its timeout.
+        max_dimension = max(600, int(os.getenv("OCR_MAX_DIMENSION", "800")))
         if max(height, width) > max_dimension:
             scale = max_dimension / max(height, width)
             image = cv2.resize(image, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
