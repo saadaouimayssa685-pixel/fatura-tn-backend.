@@ -70,10 +70,13 @@ class OptimizedOCRExtractor:
         # keeps a single Tesseract process while preserving the fields needed
         # for classification, line extraction and validation.
         def prepare_region(region, upscale_to=0):
-            max_dimension = max(700, int(os.getenv("OCR_FAST_REGION_MAX_DIMENSION", "1200")))
+            # A 1000 px cap keeps full scans below the Render Free timeout,
+            # while retaining the small labels and table rows needed here.
+            max_dimension = max(700, int(os.getenv("OCR_FAST_REGION_MAX_DIMENSION", "1000")))
             largest_dimension = max(region.shape[:2])
             if upscale_to and largest_dimension < upscale_to:
-                scale = upscale_to / largest_dimension
+                target_dimension = min(upscale_to, max_dimension)
+                scale = target_dimension / largest_dimension
                 region = cv2.resize(region, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
             elif largest_dimension > max_dimension:
                 scale = max_dimension / largest_dimension

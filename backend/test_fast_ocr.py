@@ -23,6 +23,20 @@ class FastOCRTests(unittest.TestCase):
         self.assertEqual(extract.call_args.kwargs["config"], "--psm 4")
         self.assertTrue(set(np.unique(np.array(extract.call_args.args[0]))) <= {0, 255})
 
+    @patch("ocr_extractor.pytesseract.image_to_data")
+    def test_client_crop_does_not_exceed_hosted_pixel_cap(self, extract):
+        extract.return_value = {
+            "text": ["FACTURE"], "conf": [90], "page_num": [1],
+            "block_num": [1], "par_num": [1], "line_num": [1],
+        }
+        instance = OptimizedOCRExtractor.__new__(OptimizedOCRExtractor)
+        instance.ocr_config = "--psm 6"
+        with patch.dict("os.environ", {"OCR_FAST_REGION_MAX_DIMENSION": "1000"}, clear=False):
+            instance._fast_extract(np.zeros((1654, 2338), dtype=np.uint8))
+
+        canvas = np.array(extract.call_args.args[0])
+        self.assertLessEqual(max(canvas.shape), 5000)
+
 
 if __name__ == "__main__":
     unittest.main()
