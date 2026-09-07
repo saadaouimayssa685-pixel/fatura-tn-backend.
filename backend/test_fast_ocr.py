@@ -49,6 +49,19 @@ class FastOCRTests(unittest.TestCase):
         self.assertEqual(extract.call_args.kwargs["timeout"], 20)
         self.assertIn("--psm 6", extract.call_args.kwargs["config"])
 
+    @patch("ocr_extractor.pytesseract.image_to_string", return_value="FACTURE QA-1")
+    @patch("ocr_extractor.pytesseract.image_to_data", side_effect=RuntimeError("timeout"))
+    def test_fast_timeout_retries_with_focused_regions(self, extract_data, extract_text):
+        instance = OptimizedOCRExtractor.__new__(OptimizedOCRExtractor)
+        instance.ocr_config = "--psm 4 -l fra+eng"
+
+        text, confidence = instance._fast_extract(np.zeros((80, 100), dtype=np.uint8))
+
+        self.assertIn("FACTURE QA-1", text)
+        self.assertEqual(confidence, 0.55)
+        self.assertEqual(extract_data.call_count, 1)
+        self.assertGreater(extract_text.call_count, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

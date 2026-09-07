@@ -177,7 +177,7 @@ class OptimizedOCRExtractor:
             # on Render Free. Retry with small, meaningful crops instead of
             # failing the invoice request or returning invented fields.
             print(f"Fast OCR canvas timed out, using focused crop fallback: {error}")
-            return self._extract_focused_regions(source_image, fast_config)
+            return self._extract_focused_regions(source_image)
         lines = {}
         confidences = []
         for index, word in enumerate(data["text"]):
