@@ -13,12 +13,14 @@ PDF text extraction and hashing-based retrieval remain available. No semantic
 embedding model is loaded. Disabled detection is recorded in the agent trace.
 Memory use under real OCR workloads still needs measurement on the host.
 
-Do not upload production invoices to this evaluation service. SQLite accounts,
-dataset indexes and uploaded documents are local and disappear on restart.
-DATABASE_URL alone does not migrate authentication or binary documents.
-Before production use, migrate authentication to persistent storage, add durable
+Configure DATABASE_URL as a secret before starting this profile. Authentication,
+sessions and invoice metadata use PostgreSQL. Startup fails if PostgreSQL is
+unavailable, and demo users are not created. Existing local accounts are not migrated.
+Do not upload production invoices to this evaluation service: dataset indexes
+and uploaded documents are still local and disappear on restart.
+Before production use, add durable
 document storage, enforce authorization on document APIs and migrate existing data.
-The local demo accounts must also be disabled for production.
+Existing demo accounts in an imported database need separate review.
 
 The Vercel API URL must only be switched after the backend and persistence have
 been tested. Never store credentials in Git or Docker build arguments.

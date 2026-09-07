@@ -16,6 +16,7 @@ from pydantic import BaseModel, Field
 
 from models import OCRResponse, InvoiceData
 from invoice_store import InvoiceStore
+from auth_database import connect_auth
 from document_store import DocumentStore
 from fatura_dataset_store import FaturaDatasetStore
 from postgres_invoice_store import PostgresInvoiceStore
@@ -68,6 +69,10 @@ ALLOWED_ORIGINS = sorted(set(
     + [origin.strip() for origin in os.getenv("ALLOWED_ORIGINS", "").split(",") if origin.strip()]
 ))
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+REQUIRE_POSTGRES = os.getenv("REQUIRE_POSTGRES", "false").lower() == "true"
+SEED_DEMO_USERS = os.getenv("SEED_DEMO_USERS", "true").lower() == "true"
+if REQUIRE_POSTGRES and not DATABASE_URL.startswith(("postgresql://", "postgres://")):
+    raise RuntimeError("Configure DATABASE_URL with a persistent PostgreSQL database.")
 ENABLE_PADDLEOCR = os.getenv("ENABLE_PADDLEOCR", "false").strip().lower() in {"1", "true", "yes", "on"}
 ENABLE_GEMMA = os.getenv("ENABLE_GEMMA", "false").strip().lower() in {"1", "true", "yes", "on"}
 ENABLE_YOLO = os.getenv("ENABLE_YOLO", "true").strip().lower() in {"1", "true", "yes", "on"}
@@ -148,7 +153,7 @@ def create_password_hash(password: str) -> tuple[str, str]:
 
 
 def auth_connection():
-    return sqlite3.connect(AUTH_DB_PATH)
+    return connect_auth(DATABASE_URL, AUTH_DB_PATH)
 
 
 def public_user(row: tuple) -> dict:
@@ -193,7 +198,10 @@ def init_auth_database():
         )
         db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email ON users(email)")
         db.execute("CREATE INDEX IF NOT EXISTS idx_auth_sessions_user_id ON auth_sessions(user_id)")
-        db.execute("PRAGMA optimize")
+        if not DATABASE_URL:
+            db.execute("PRAGMA optimize")
+        if not SEED_DEMO_USERS:
+            return
         demo_email = "demo@fatura.tn"
         existing = db.execute("SELECT id FROM users WHERE email = ?", (demo_email,)).fetchone()
         if not existing:
@@ -273,6 +281,8 @@ try:
     rag_service = RAGService(database_url=DATABASE_URL, storage_dir=RAG_STORAGE_FOLDER)
     ACTIVE_DATABASE_BACKEND = "postgresql"
 except Exception as database_error:
+    if REQUIRE_POSTGRES or DATABASE_URL:
+        raise RuntimeError("PostgreSQL unavailable; refusing temporary SQLite fallback.") from database_error
     print(f"PostgreSQL indisponible, demarrage en SQLite local: {database_error}")
     invoice_store = InvoiceStore(db_path=INVOICE_DB_PATH, documents_dir=INVOICE_STORAGE_FOLDER)
     document_store = DocumentStore(db_path=str(PROJECT_ROOT / "data" / "document_ai.sqlite3"), documents_dir=DOCUMENT_STORAGE_FOLDER)
@@ -2193,6 +2203,7 @@ async def health_check():
             "paddle_pipeline": "available" if paddle_pipeline is not None else "unavailable",
             "yolo_model": "available" if model else "unavailable",
             "database": ACTIVE_DATABASE_BACKEND,
+            "auth_store": "postgresql" if DATABASE_URL else "sqlite",
             "invoice_store": "postgresql_jsonb" if ACTIVE_DATABASE_BACKEND == "postgresql" else "sqlite_json",
             "document_store": "postgresql_jsonb" if ACTIVE_DATABASE_BACKEND == "postgresql" else "sqlite_json",
             "rag_store": "postgresql_jsonb_embeddings" if ACTIVE_DATABASE_BACKEND == "postgresql" else "sqlite_json_embeddings",
