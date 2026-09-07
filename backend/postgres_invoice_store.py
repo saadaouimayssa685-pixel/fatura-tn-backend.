@@ -1,6 +1,6 @@
 import json
 import os
-import shutil
+from postgres_file_store import PostgresFileStore
 from typing import Any, Dict, List, Optional
 
 
@@ -14,6 +14,7 @@ class PostgresInvoiceStore:
 
     def __init__(self, database_url: str, documents_dir: str = "invoice_storage/documents"):
         self.database_url = database_url
+        self.files = PostgresFileStore(database_url)
         self.documents_dir = documents_dir
         os.makedirs(documents_dir, exist_ok=True)
         self._init_db()
@@ -525,17 +526,7 @@ class PostgresInvoiceStore:
         )
 
     def _persist_file(self, source_file_path: str, filename: str) -> str:
-        safe_name = "".join(char if char.isalnum() or char in "._-" else "_" for char in filename)
-        base_name, extension = os.path.splitext(safe_name)
-        candidate = os.path.join(self.documents_dir, safe_name)
-        counter = 1
-
-        while os.path.exists(candidate):
-            candidate = os.path.join(self.documents_dir, f"{base_name}_{counter}{extension}")
-            counter += 1
-
-        shutil.copy2(source_file_path, candidate)
-        return candidate
+        return self.files.put(source_file_path)
 
     def _row_to_invoice(self, row) -> Dict[str, Any]:
         payload = dict(row)

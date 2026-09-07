@@ -21,6 +21,7 @@ from document_store import DocumentStore
 from fatura_dataset_store import FaturaDatasetStore
 from postgres_invoice_store import PostgresInvoiceStore
 from postgres_document_store import PostgresDocumentStore
+from postgres_file_store import PostgresFileStore
 from ocr_extractor import OptimizedOCRExtractor
 from pdf_extractor import PDFExtractor
 from rag import RAGService
@@ -2207,6 +2208,7 @@ async def health_check():
             "invoice_store": "postgresql_jsonb" if ACTIVE_DATABASE_BACKEND == "postgresql" else "sqlite_json",
             "document_store": "postgresql_jsonb" if ACTIVE_DATABASE_BACKEND == "postgresql" else "sqlite_json",
             "rag_store": "postgresql_jsonb_embeddings" if ACTIVE_DATABASE_BACKEND == "postgresql" else "sqlite_json_embeddings",
+            "file_store": "postgresql_bytea" if ACTIVE_DATABASE_BACKEND == "postgresql" else "local_disk",
             "upload_folder": "accessible" if os.path.exists(UPLOAD_FOLDER) else "error"
         },
         "version": "2.0.0"
@@ -3569,7 +3571,18 @@ async def invoice_catalog_download(source: str = "processed", invoice_id: str = 
             return StreamingResponse(io.BytesIO(data), media_type=media_type, headers=headers)
 
         invoice = invoice_store.get_invoice(int(invoice_id))
-        file_path = Path(invoice.get("file_path", ""))
+        reference = invoice.get("file_path", "")
+        if reference.startswith(PostgresFileStore.PREFIX):
+            from urllib.parse import quote
+            content = invoice_store.files.get(reference)
+            filename = invoice.get("filename") or "document"
+            disposition = "inline" if inline else "attachment"
+            return StreamingResponse(
+                io.BytesIO(content),
+                media_type=mimetypes.guess_type(filename)[0] or "application/octet-stream",
+                headers={"Content-Disposition": f"{disposition}; filename*=UTF-8''{quote(filename, safe='')}"},
+            )
+        file_path = Path(reference)
         if not file_path.exists():
             raise FileNotFoundError(f"Fichier introuvable: {file_path}")
         return FileResponse(

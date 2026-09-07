@@ -7,6 +7,7 @@ from .chunker import DocumentChunker
 from .embeddings import EmbeddingProvider, cosine_similarity
 from .postgres_store import PostgresRAGStore
 from .store import SQLiteRAGStore
+from postgres_file_store import PostgresFileStore
 
 
 class RAGService:
@@ -20,6 +21,7 @@ class RAGService:
         sqlite_db_path: Optional[str] = None,
     ):
         self.storage_dir = storage_dir
+        self.files = PostgresFileStore(database_url) if database_url else None
         os.makedirs(storage_dir, exist_ok=True)
         if database_url:
             self.store = PostgresRAGStore(database_url)
@@ -117,6 +119,8 @@ class RAGService:
         return self.store.list_documents()
 
     def _persist_source_file(self, source_file_path: str, filename: str) -> str:
+        if self.files is not None:
+            return self.files.put(source_file_path)
         safe_name = "".join(char if char.isalnum() or char in "._-" else "_" for char in filename)
         base_name, extension = os.path.splitext(safe_name)
         candidate = os.path.join(self.storage_dir, safe_name)
