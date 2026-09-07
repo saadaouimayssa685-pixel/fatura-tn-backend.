@@ -84,16 +84,54 @@ class OptimizedOCRExtractor:
             _, region = cv2.threshold(region, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
             return region
 
+        def compact_vertical_gaps(region):
+            """Remove large blank table bands before the single hosted OCR pass."""
+            row_ink = np.count_nonzero(region < 220, axis=1)
+            minimum_ink = max(12, region.shape[1] // 45)
+            active_rows = row_ink >= minimum_ink
+            active_indexes = np.flatnonzero(active_rows)
+            if active_indexes.size == 0:
+                return region
+
+            join_gap = max(28, region.shape[0] // 30)
+            margin = max(12, region.shape[0] // 100)
+            spans = []
+            start = previous = int(active_indexes[0])
+            for index in active_indexes[1:]:
+                index = int(index)
+                if index - previous > join_gap:
+                    spans.append((max(0, start - margin), min(region.shape[0], previous + margin)))
+                    start = index
+                previous = index
+            spans.append((max(0, start - margin), min(region.shape[0], previous + margin)))
+
+            if len(spans) == 1:
+                return region[spans[0][0]:spans[0][1], :]
+
+            separator_height = 24
+            compact_height = sum(end - start for start, end in spans) + separator_height * (len(spans) - 1)
+            compact = np.full((compact_height, region.shape[1]), 255, dtype=np.uint8)
+            cursor = 0
+            for offset, (start, end) in enumerate(spans):
+                part = region[start:end, :]
+                compact[cursor:cursor + part.shape[0], :] = part
+                cursor += part.shape[0]
+                if offset < len(spans) - 1:
+                    cursor += separator_height
+            return compact
+
         if height >= 500 and width >= 500:
-            header = prepare_region(image[: max(1, round(height * 0.31)), :])
-            customer_identity = prepare_region(
+            header = compact_vertical_gaps(prepare_region(image[: max(1, round(height * 0.31)), :]))
+            customer_identity = compact_vertical_gaps(prepare_region(
                 image[round(height * 0.13):round(height * 0.32), round(width * 0.42):],
                 upscale_to=1200,
-            )
+            ))
             # Keep the complete centre, not only its right totals column: the
             # left side carries article descriptions needed to prove rows.
-            table_and_totals = prepare_region(image[round(height * 0.30):round(height * 0.76), :])
-            footer = prepare_region(image[round(height * 0.72):, :])
+            table_and_totals = compact_vertical_gaps(
+                prepare_region(image[round(height * 0.30):round(height * 0.76), :])
+            )
+            footer = compact_vertical_gaps(prepare_region(image[round(height * 0.72):, :]))
             canvas_width = max(
                 header.shape[1], customer_identity.shape[1], table_and_totals.shape[1], footer.shape[1]
             )

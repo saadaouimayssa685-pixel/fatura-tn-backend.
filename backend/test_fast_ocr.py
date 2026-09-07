@@ -35,7 +35,7 @@ class FastOCRTests(unittest.TestCase):
             instance._fast_extract(np.zeros((1654, 2338), dtype=np.uint8))
 
         canvas = np.array(extract.call_args.args[0])
-        self.assertLessEqual(max(canvas.shape), 5000)
+        self.assertLessEqual(max(canvas.shape), 3000)
 
 
 if __name__ == "__main__":
