@@ -26,7 +26,7 @@ from ocr_extractor import OptimizedOCRExtractor
 from pdf_extractor import PDFExtractor
 from rag import RAGService
 from ollama_analyzer import OllamaInvoiceAnalyzer
-from ai_analyzer import OptimizedAIAnalyzer
+from gemini_cloud import GeminiCloud
 from dotenv import load_dotenv
 
 
@@ -300,7 +300,7 @@ except Exception as database_error:
     rag_service = RAGService(database_url="", storage_dir=RAG_STORAGE_FOLDER, sqlite_db_path=RAG_DB_PATH)
     ACTIVE_DATABASE_BACKEND = "sqlite"
 ollama_analyzer = OllamaInvoiceAnalyzer()
-ai_analyzer = OptimizedAIAnalyzer()
+ai_analyzer = GeminiCloud()
 fatura_dataset_store = FaturaDatasetStore(db_path=FATURA_DATASET_DB_PATH, zip_path=FATURA_DATASET_ZIP)
 gemma_analyzer = None
 model = None
@@ -1841,7 +1841,7 @@ async def run_document_agent(
                 metadata={"requested_model": model_choice, "selected_model": selected_model_choice},
             )
 
-            invoice_data, model_used, analysis_raw = analyze_invoice_fields(extracted_text, selected_model_choice)
+            invoice_data, model_used, analysis_raw = await run_in_threadpool(analyze_invoice_fields, extracted_text, selected_model_choice)
             add_agent_decision(
                 agent_decisions,
                 step="field_extraction",
@@ -3764,15 +3764,21 @@ async def rag_index_document(file: UploadFile = File(...)):
 async def rag_query(request: RAGQueryRequest):
     """Recherche les passages pertinents et prépare un prompt RAG."""
     try:
-        result = rag_service.query(
+        from starlette.concurrency import run_in_threadpool
+        result = await run_in_threadpool(rag_service.query,
             question=request.question,
             document_id=request.document_id,
             top_k=request.top_k,
         )
-        return {
-            "success": True,
-            **result,
-        }
+        result["generation"] = {"status": "unavailable", "model": None}
+        if ai_analyzer.model and result["sources"]:
+            try:
+                generated = await run_in_threadpool(ai_analyzer.answer_sources, request.question, result["sources"])
+                result.update(generated)
+                result["generation"] = {"status": "completed", "model": ai_analyzer.model_name}
+            except RuntimeError as error:
+                result["generation"] = {"status": "failed", "message": str(error), "model": ai_analyzer.model_name}
+        return {"success": True, **result}
     except Exception as e:
         print(f"❌ Erreur requête RAG: {e}")
         return {
