@@ -58,20 +58,36 @@ class OptimizedOCRExtractor:
 
     def _fast_extract(self, image):
         height, width = image.shape[:2]
-        # Render Free provides only 0.1 CPU. At 800px, headers, table labels
-        # and totals remain usable while Tesseract finishes before its timeout.
-        max_dimension = max(600, int(os.getenv("OCR_MAX_DIMENSION", "800")))
-        if max(height, width) > max_dimension:
-            scale = max_dimension / max(height, width)
-            image = cv2.resize(image, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
         if image.ndim == 3:
             image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        # Suppress faint reverse-side printing before segmenting the full page.
-        _, image = cv2.threshold(image, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        config = self.ocr_config.replace("--psm 6", "--psm 3")
+
+        # Full-page OCR is too slow on the Render Free 0.1 CPU plan. Invoices
+        # put the legal identity and reference in the header, and totals in the
+        # footer. Combining just those regions preserves the fields needed for
+        # classification and validation in a single Tesseract process.
+        def prepare_region(region):
+            max_dimension = max(700, int(os.getenv("OCR_FAST_REGION_MAX_DIMENSION", "1000")))
+            if max(region.shape[:2]) > max_dimension:
+                scale = max_dimension / max(region.shape[:2])
+                region = cv2.resize(region, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+            _, region = cv2.threshold(region, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            return region
+
+        if height >= 500 and width >= 500:
+            header = prepare_region(image[: max(1, round(height * 0.31)), :])
+            footer = prepare_region(image[round(height * 0.72):, :])
+            canvas_width = max(header.shape[1], footer.shape[1])
+            image = np.full((header.shape[0] + footer.shape[0] + 60, canvas_width), 255, dtype=np.uint8)
+            image[:header.shape[0], :header.shape[1]] = header
+            footer_y = header.shape[0] + 60
+            image[footer_y:footer_y + footer.shape[0], :footer.shape[1]] = footer
+        else:
+            image = prepare_region(image)
+
         data = pytesseract.image_to_data(
-            Image.fromarray(image), config=config,
-            output_type=pytesseract.Output.DICT, timeout=90,
+            Image.fromarray(image), config=self.ocr_config,
+            output_type=pytesseract.Output.DICT,
+            timeout=max(10, int(os.getenv("OCR_TESSERACT_TIMEOUT", "40"))),
         )
         lines = {}
         confidences = []
