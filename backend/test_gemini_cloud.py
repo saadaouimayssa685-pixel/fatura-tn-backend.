@@ -42,6 +42,16 @@ class GeminiTests(unittest.TestCase):
             result = self.client.answer_sources("Total?", [{"text": "No amounts"}])
             self.assertNotEqual(result["answer"], "Unproven")
 
+    def test_invoice_prompt_includes_field_rag_evidence(self):
+        with patch.object(self.client, "generate_json", return_value={"invoice_number": "F-1", "items": []}) as generate:
+            result = self.client.analyze_invoice_text(
+                "FACTURE F-1",
+                field_evidence={"invoice_number": [{"page_number": 1, "text": "FACTURE F-1"}]},
+            )
+        self.assertEqual(result.invoice_number, "F-1")
+        payload = generate.call_args.args[1]
+        self.assertEqual(payload["rag_evidence_by_field"]["invoice_number"][0]["passage"], "FACTURE F-1")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -590,6 +590,104 @@ def normalize_invoice_data(invoice_data: Optional[InvoiceData], extracted_text: 
     return normalized
 
 
+EVIDENCE_GUARDED_FIELDS = {
+    "invoice_number", "date", "vendor_name", "vendor_tax_id", "customer_name",
+    "customer_tax_id", "vendor_phone", "customer_phone", "subtotal", "tax_amount",
+    "stamp_duty", "total_amount", "currency",
+}
+
+
+def _canonical_identifier(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(value or "").lower())
+
+
+def _canonical_date(value: Any) -> str:
+    match = re.search(r"(\d{1,2})[./-](\d{1,2})[./-](\d{2,4})", str(value or ""))
+    if not match:
+        return ""
+    return "/".join(match.groups())
+
+
+def _money_values_in_text(text: str) -> List[float]:
+    values = []
+    for token in re.findall(r"\b\d+(?:[ .]\d{3})*(?:[,.]\d{1,3})?\b", text or ""):
+        amount = safe_float(token)
+        if amount > 0:
+            values.append(amount)
+    return values
+
+
+def value_has_ocr_support(field_name: str, value: Any, text: str) -> bool:
+    """Require a proposed high-risk field to be traceable to OCR text."""
+    if not field_has_value(field_name, value):
+        return False
+    if field_name in {"subtotal", "tax_amount", "stamp_duty", "total_amount"}:
+        expected = safe_float(value)
+        return any(abs(candidate - expected) <= 0.005 for candidate in _money_values_in_text(text))
+    if field_name == "date":
+        expected = _canonical_date(value)
+        return bool(expected and expected in re.sub(r"[.\-]", "/", text or ""))
+    if field_name == "currency":
+        return bool(re.search(rf"\b{re.escape(str(value).upper())}\b", text or "", flags=re.IGNORECASE))
+    expected = _canonical_identifier(value)
+    observed = _canonical_identifier(text)
+    if field_name in {"vendor_name", "customer_name"}:
+        tokens = [token for token in re.findall(r"[a-z0-9]{3,}", str(value).lower())]
+        return bool(tokens and all(token in observed for token in tokens))
+    return bool(expected and expected in observed)
+
+
+def enforce_evidence_guard(
+    normalized_fields: Dict[str, Any],
+    extracted_text: str,
+    field_evidence: Optional[Dict[str, Any]] = None,
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Reject LLM/fallback values that cannot be found in OCR and return auditable proofs."""
+    fallback = extract_invoice_fields_fallback(extracted_text)
+    guarded = dict(normalized_fields)
+    proofs: Dict[str, Any] = {}
+
+    for field_name in EVIDENCE_GUARDED_FIELDS:
+        value = guarded.get(field_name)
+        supported = value_has_ocr_support(field_name, value, extracted_text)
+        if not supported:
+            fallback_value = fallback.get(field_name, "")
+            if value_has_ocr_support(field_name, fallback_value, extracted_text):
+                guarded[field_name] = fallback_value
+                value = fallback_value
+                supported = True
+            else:
+                guarded[field_name] = 0.0 if field_name in {"subtotal", "tax_amount", "stamp_duty", "total_amount"} else ""
+                value = guarded[field_name]
+        matching_chunk = next(
+            (
+                chunk for chunk in (field_evidence or {}).get(field_name, [])
+                if supported and value_has_ocr_support(field_name, value, chunk.get("text", ""))
+            ),
+            None,
+        )
+        proofs[field_name] = {
+            "value": value,
+            "supported": supported,
+            "source": {
+                "type": "rag_chunk",
+                "chunk_index": matching_chunk.get("chunk_index"),
+                "page_number": matching_chunk.get("page_number"),
+                "preview": matching_chunk.get("preview"),
+            } if matching_chunk else ("ocr_text" if supported else None),
+        }
+
+    verified_items = []
+    for item in guarded.get("items", []):
+        designation = str(item.get("description") or "").strip()
+        tokens = [token for token in re.findall(r"[a-z0-9]{3,}", designation.lower())]
+        if tokens and all(token in _canonical_identifier(extracted_text) for token in tokens):
+            verified_items.append(item)
+    guarded["items"] = verified_items
+    proofs["items"] = {"value": len(verified_items), "supported": bool(verified_items), "source": "ocr_text" if verified_items else None}
+    return guarded, proofs
+
+
 FIELD_RETRIEVAL_QUERIES = {
     "invoice_number": ["facture", "numero facture", "invoice number", "n facture"],
     "date": ["date facture", "invoice date", "date"],
@@ -1405,7 +1503,11 @@ def detect_document_objects(file_path: str, confidence_threshold: float = 0.25) 
     return detections
 
 
-def analyze_invoice_fields(extracted_text: str, model_choice: str) -> tuple[Optional[InvoiceData], str, Dict[str, Any]]:
+def analyze_invoice_fields(
+    extracted_text: str,
+    model_choice: str,
+    field_evidence: Optional[Dict[str, Any]] = None,
+) -> tuple[Optional[InvoiceData], str, Dict[str, Any]]:
     """Analyse les champs de facture avec le modele choisi puis fallback regex."""
     invoice_data = None
     model_used = "fallback_regex"
@@ -1421,7 +1523,7 @@ def analyze_invoice_fields(extracted_text: str, model_choice: str) -> tuple[Opti
         elif model_choice == "fallback":
             model_used = "fallback_regex"
         else:
-            invoice_data = ai_analyzer.analyze_invoice_text(extracted_text)
+            invoice_data = ai_analyzer.analyze_invoice_text(extracted_text, field_evidence=field_evidence)
             model_used = "gemini" if ai_analyzer.model else "fallback_regex"
     except Exception as analysis_error:
         print(f"Analyse IA indisponible, fallback regex: {analysis_error}")
@@ -1521,7 +1623,10 @@ def choose_agent_model(
     return "local", "standard_document_local_llm"
 
 
-def validate_normalized_invoice_fields(normalized_fields: Dict[str, Any]) -> List[Dict[str, Any]]:
+def validate_normalized_invoice_fields(
+    normalized_fields: Dict[str, Any],
+    field_proofs: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
     """Run deterministic business checks after extraction and normalization."""
     issues: List[Dict[str, Any]] = []
 
@@ -1532,6 +1637,17 @@ def validate_normalized_invoice_fields(normalized_fields: Dict[str, Any]) -> Lis
                     "code": f"missing_{field_name}",
                     "severity": "blocking",
                     "message": f"Required field '{field_name}' is missing.",
+                }
+            )
+
+    for field_name in AGENT_POLICY["required_invoice_fields"]:
+        proof = (field_proofs or {}).get(field_name, {})
+        if field_has_value(field_name, normalized_fields.get(field_name)) and not proof.get("supported"):
+            issues.append(
+                {
+                    "code": f"unproven_{field_name}",
+                    "severity": "blocking",
+                    "message": f"Required field '{field_name}' has no OCR evidence and must be reviewed.",
                 }
             )
 
@@ -1795,6 +1911,7 @@ async def run_document_agent(
         model_used = "none"
         analysis_raw: Dict[str, Any] = {}
         field_evidence: Dict[str, Any] = {}
+        field_proofs: Dict[str, Any] = {}
         validation_issues: List[Dict[str, Any]] = []
         selected_model_choice = model_choice or "local"
 
@@ -1841,7 +1958,9 @@ async def run_document_agent(
                 metadata={"requested_model": model_choice, "selected_model": selected_model_choice},
             )
 
-            invoice_data, model_used, analysis_raw = await run_in_threadpool(analyze_invoice_fields, extracted_text, selected_model_choice)
+            invoice_data, model_used, analysis_raw = await run_in_threadpool(
+                analyze_invoice_fields, extracted_text, selected_model_choice, field_evidence
+            )
             add_agent_decision(
                 agent_decisions,
                 step="field_extraction",
@@ -1852,8 +1971,11 @@ async def run_document_agent(
             )
 
             normalized_fields = normalize_invoice_data(invoice_data, extracted_text)
+            normalized_fields, field_proofs = enforce_evidence_guard(
+                normalized_fields, extracted_text, field_evidence
+            )
             missing_fields = missing_required_invoice_fields(normalized_fields)
-            validation_issues = validate_normalized_invoice_fields(normalized_fields)
+            validation_issues = validate_normalized_invoice_fields(normalized_fields, field_proofs)
             blocking_validation_issues = [
                 issue for issue in validation_issues if issue.get("severity") == "blocking"
             ]
@@ -1865,6 +1987,7 @@ async def run_document_agent(
                 action="continue" if not blocking_validation_issues else "human_review_recommended",
                 metadata={
                     "missing_required_fields": missing_fields,
+                    "field_proofs": field_proofs,
                     "validation_issues": validation_issues,
                 },
             )
@@ -1892,6 +2015,7 @@ async def run_document_agent(
                     "extraction_metadata": extraction_metadata,
                     "object_detections": detections,
                     "field_evidence": field_evidence,
+                    "field_proofs": field_proofs,
                     "agent_decisions": agent_decisions,
                     "agent_actions": agent_actions,
                     "agent_policy": AGENT_POLICY,
@@ -1971,6 +2095,7 @@ async def run_document_agent(
                         "document_type": document_type,
                         "invoice_id": invoice_record["id"] if invoice_record else None,
                         "field_evidence": field_evidence,
+                        "field_proofs": field_proofs,
                         "agent_decisions": agent_decisions,
                         "agent_actions": agent_actions,
                     },
