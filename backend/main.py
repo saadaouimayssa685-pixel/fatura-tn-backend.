@@ -1,6 +1,6 @@
 ﻿from fastapi import FastAPI, File, UploadFile, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
 import aiofiles
 import hashlib
 import io
@@ -27,7 +27,6 @@ from ollama_analyzer import OllamaInvoiceAnalyzer
 from ai_analyzer import OptimizedAIAnalyzer
 from dotenv import load_dotenv
 
-from ultralytics import YOLO
 
 # Charger les variables d'environnement
 BACKEND_DIR = Path(__file__).resolve().parent
@@ -71,6 +70,7 @@ ALLOWED_ORIGINS = sorted(set(
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 ENABLE_PADDLEOCR = os.getenv("ENABLE_PADDLEOCR", "false").strip().lower() in {"1", "true", "yes", "on"}
 ENABLE_GEMMA = os.getenv("ENABLE_GEMMA", "false").strip().lower() in {"1", "true", "yes", "on"}
+ENABLE_YOLO = os.getenv("ENABLE_YOLO", "true").strip().lower() in {"1", "true", "yes", "on"}
 
 app = FastAPI(
     title="Optimized Invoice OCR API",
@@ -88,6 +88,16 @@ app.add_middleware(
 )
 
 # Créer le dossier de téléchargement
+@app.middleware("http")
+async def check_detection_availability(request, call_next):
+    if request.url.path in {"/extract-entities", "/extract-entities-with-ocr"} and not ENABLE_YOLO:
+        return JSONResponse(
+            status_code=503,
+            content={"detail": "Detection YOLO indisponible sur ce serveur."},
+        )
+    return await call_next(request)
+
+
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(INVOICE_STORAGE_FOLDER, exist_ok=True)
 os.makedirs(DOCUMENT_STORAGE_FOLDER, exist_ok=True)
@@ -272,8 +282,13 @@ ollama_analyzer = OllamaInvoiceAnalyzer()
 ai_analyzer = OptimizedAIAnalyzer()
 fatura_dataset_store = FaturaDatasetStore(db_path=FATURA_DATASET_DB_PATH, zip_path=FATURA_DATASET_ZIP)
 gemma_analyzer = None
-model = YOLO(YOLO_MODEL_PATH)
-classes = model.names
+model = None
+classes = {}
+if ENABLE_YOLO:
+    from ultralytics import YOLO
+
+    model = YOLO(YOLO_MODEL_PATH)
+    classes = model.names
 
 # Initialiser PaddleOCR seulement si demandé. Son chargement peut être très long
 # sur un poste local et bloquer le démarrage de l'API.
@@ -1716,7 +1731,16 @@ async def run_document_agent(
             metadata=classification_details,
         )
 
-        if detect_objects and not is_pdf_file(file_path):
+        if detect_objects and model is None:
+            detections = []
+            add_agent_decision(
+                agent_decisions,
+                step="yolo_visual_detection",
+                decision="skip_yolo_unavailable",
+                reason="Object detection is not available on this server.",
+                action="continue",
+            )
+        elif detect_objects and not is_pdf_file(file_path):
             detections = detect_document_objects(file_path)
             add_agent_decision(
                 agent_decisions,
@@ -2166,7 +2190,7 @@ async def health_check():
             "ollama_analyzer": "available" if ollama_analyzer.is_available() else "unavailable",
             "ollama_model": ollama_analyzer.model_name,
             "gemma_analyzer": "disabled" if not ENABLE_GEMMA else ("available" if gemma_analyzer and gemma_analyzer.model else "lazy"),
-            "paddle_pipeline": "available" if model else "unavailable",
+            "paddle_pipeline": "available" if paddle_pipeline is not None else "unavailable",
             "yolo_model": "available" if model else "unavailable",
             "database": ACTIVE_DATABASE_BACKEND,
             "invoice_store": "postgresql_jsonb" if ACTIVE_DATABASE_BACKEND == "postgresql" else "sqlite_json",
