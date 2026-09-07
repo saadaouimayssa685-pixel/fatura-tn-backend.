@@ -87,6 +87,8 @@ class RAGService:
         for chunk in chunks:
             semantic_score = cosine_similarity(query_embedding, chunk["embedding"])
             lexical_score = self._lexical_score(question, chunk["chunk_text"])
+            if lexical_score <= 0 and self.embeddings.backend != "sentence_transformers":
+                continue
             score = (semantic_score * 0.75) + (lexical_score * 0.25)
             scored_chunks.append({
                 "score": round(float(score), 4),

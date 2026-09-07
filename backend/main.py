@@ -96,6 +96,16 @@ app.add_middleware(
 # Créer le dossier de téléchargement
 @app.middleware("http")
 async def check_detection_availability(request, call_next):
+    if (REQUIRE_POSTGRES and request.method not in {"GET", "HEAD", "OPTIONS"}
+            and request.url.path not in {"/auth/signup", "/auth/login"}):
+        from starlette.concurrency import run_in_threadpool
+        user = await run_in_threadpool(user_from_authorization, request.headers.get("authorization"))
+        if not user:
+            headers = {}
+            origin = request.headers.get("origin")
+            if origin in ALLOWED_ORIGINS:
+                headers = {"Access-Control-Allow-Origin": origin, "Vary": "Origin"}
+            return JSONResponse(status_code=401, content={"detail": "Connexion requise."}, headers=headers)
     if request.url.path in {"/extract-entities", "/extract-entities-with-ocr"} and not ENABLE_YOLO:
         return JSONResponse(
             status_code=503,
