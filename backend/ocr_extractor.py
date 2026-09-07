@@ -1,4 +1,5 @@
 import os
+import re
 import tempfile
 from typing import Dict, Tuple
 
@@ -84,8 +85,12 @@ class OptimizedOCRExtractor:
         else:
             image = prepare_region(image)
 
+        # English alone is much lighter on the 0.1 CPU hosted profile and is
+        # sufficient for Latin invoice labels, references and TND totals.
+        fast_language = os.getenv("OCR_FAST_LANGUAGE", "eng").strip() or "eng"
+        fast_config = re.sub(r"-l\s+\S+", f"-l {fast_language}", self.ocr_config)
         data = pytesseract.image_to_data(
-            Image.fromarray(image), config=self.ocr_config,
+            Image.fromarray(image), config=fast_config,
             output_type=pytesseract.Output.DICT,
             timeout=max(10, int(os.getenv("OCR_TESSERACT_TIMEOUT", "40"))),
         )
