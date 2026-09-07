@@ -58,8 +58,9 @@ class OptimizedOCRExtractor:
 
     def _fast_extract(self, image):
         height, width = image.shape[:2]
-        if max(height, width) > 2200:
-            scale = 2200 / max(height, width)
+        max_dimension = max(1000, int(os.getenv("OCR_MAX_DIMENSION", "1600")))
+        if max(height, width) > max_dimension:
+            scale = max_dimension / max(height, width)
             image = cv2.resize(image, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
         if image.ndim == 3:
             image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
