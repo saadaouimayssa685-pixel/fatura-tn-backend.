@@ -244,7 +244,10 @@ class OptimizedOCRExtractor:
             return pytesseract.image_to_string(
                 Image.fromarray(region),
                 config=config,
-                timeout=max(8, int(os.getenv("OCR_HEADER_REGION_TIMEOUT", "15"))),
+                # Render Free has 0.1 CPU. This is a small crop, so allowing
+                # it more time is still safer and cheaper than accepting an
+                # unreadable or fabricated invoice date.
+                timeout=max(15, int(os.getenv("OCR_HEADER_REGION_TIMEOUT", "45"))),
             ).strip()
         except RuntimeError as error:
             print(f"Header date OCR timed out: {error}")
