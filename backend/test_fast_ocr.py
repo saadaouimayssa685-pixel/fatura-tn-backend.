@@ -70,6 +70,18 @@ class FastOCRTests(unittest.TestCase):
         self.assertIn("Date : 28-11-2019", text)
         self.assertEqual(extract_header.call_count, 1)
 
+    @patch.object(OptimizedOCRExtractor, "_extract_header_date_evidence", return_value="Date : 28-11-2019")
+    def test_header_date_retry_is_shared_by_full_ocr(self, extract_header):
+        instance = OptimizedOCRExtractor.__new__(OptimizedOCRExtractor)
+
+        text, confidence = instance._append_header_date_evidence(
+            "Date : 20-14-2019", 0.55, np.zeros((1654, 2338), dtype=np.uint8)
+        )
+
+        self.assertEqual(confidence, 0.55)
+        self.assertIn("Date : 28-11-2019", text)
+        self.assertEqual(extract_header.call_count, 1)
+
     @patch("ocr_extractor.pytesseract.image_to_string", return_value="FACTURE QA-1")
     def test_timeout_uses_small_focused_regions(self, extract):
         instance = OptimizedOCRExtractor.__new__(OptimizedOCRExtractor)

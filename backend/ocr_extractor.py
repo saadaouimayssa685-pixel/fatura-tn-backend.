@@ -56,7 +56,8 @@ class OptimizedOCRExtractor:
             return self._fast_extract(image)
 
         variants = self._build_preprocessing_variants(image)
-        return self._run_tesseract_best(variants)
+        text, confidence = self._run_tesseract_best(variants)
+        return self._append_header_date_evidence(text, confidence, image)
 
     def _fast_extract(self, image):
         height, width = image.shape[:2]
@@ -190,15 +191,20 @@ class OptimizedOCRExtractor:
             if confidence >= 0:
                 confidences.append(confidence)
         text = "\n".join(" ".join(words) for words in lines.values())
-        # The compact canvas is deliberately inexpensive, but it can merge a
-        # small date label into nearby header text. Recover only that missing
-        # primary field from its own crop instead of rerunning full-page OCR.
+        return self._append_header_date_evidence(
+            text,
+            sum(confidences) / len(confidences) / 100 if confidences else 0.0,
+            source_image,
+        )
+
+    def _append_header_date_evidence(self, text, confidence, image):
+        """Supplement OCR with a small header crop only when its date is invalid."""
+        height, width = image.shape[:2]
         if height >= 500 and width >= 500 and not self._contains_valid_date(text):
-            date_evidence = self._extract_header_date_evidence(source_image)
+            date_evidence = self._extract_header_date_evidence(image)
             if date_evidence:
                 text = f"{text}\n{date_evidence}"
-
-        return (text, sum(confidences) / len(confidences) / 100 if confidences else 0.0)
+        return text, confidence
 
     @staticmethod
     def _contains_valid_date(text):
