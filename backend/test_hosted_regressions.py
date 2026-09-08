@@ -92,6 +92,28 @@ MF : 1547376 Z/N/C/000"""
         self.assertEqual(hints["customer_tax_id"], "1362434/S")
         self.assertEqual(hints["vendor_tax_id"], "1547376Z/N/C/000")
 
+    def test_header_address_belongs_to_vendor(self):
+        tree = ast.parse(Path("main.py").read_text(encoding="utf-8-sig"))
+        names = {"clean_tax_identifier", "extract_party_hints"}
+        module = ast.Module(
+            body=[node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in names],
+            type_ignores=[],
+        )
+        scope = {"re": re, "Dict": dict}
+        exec(compile(module, "main.py", "exec"), scope)
+
+        text = """BEN ABDELKADER
+Adresse : Rue Jawdet Al-Hayet Choutrana 1 Sidi Salah
+Téléphone : 22 629 288
+Nom du Client : BRIDGE IMMOBILIERE
+MF : 1362434/S
+ADRESSE:
+MF : 1547376 Z/N/C/000"""
+        hints = scope["extract_party_hints"](text)
+
+        self.assertEqual(hints["vendor_address"], "Rue Jawdet Al-Hayet Choutrana 1 Sidi Salah")
+        self.assertEqual(hints["customer_address"], "")
+
     def test_ocr_reference_artifact_does_not_hide_a_line_item(self):
         tree = ast.parse(Path("main.py").read_text(encoding="utf-8-sig"))
         names = {"safe_float", "extract_columnar_invoice_items"}

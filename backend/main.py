@@ -68,6 +68,8 @@ DEFAULT_ALLOWED_ORIGINS = [
     "http://127.0.0.1:5174",
     "http://localhost:5175",
     "http://127.0.0.1:5175",
+    "http://localhost:5176",
+    "http://127.0.0.1:5176",
 ]
 ALLOWED_ORIGINS = sorted(set(
     DEFAULT_ALLOWED_ORIGINS
@@ -1288,6 +1290,28 @@ def extract_party_hints(text: str) -> Dict[str, str]:
     lines = [re.sub(r"\s+", " ", line).strip(" .:-|") for line in re.split(r"[\n\r]+", text) if line.strip()]
     tax_ids = re.findall(r"\b\d{5,8}\s*[A-Z]?(?:\s*/\s*[A-Z0-9]{1,3}){1,4}\b|\b\d{5,8}[A-Z]{1,3}\d{3}\b", text, flags=re.IGNORECASE)
     tax_ids = [clean_tax_identifier(value) for value in tax_ids if clean_tax_identifier(value)]
+
+    # Address labels in this invoice family belong to the party whose block
+    # contains them. A footer address is still supplier evidence; never copy
+    # it into the customer fields just because it is near the totals.
+    customer_anchor = re.search(
+        r"(?:Nom\s+du\s+Client|Client|Customer|Raison\s+Sociale?)\s*[:;]",
+        text,
+        flags=re.IGNORECASE,
+    )
+    for address_match in re.finditer(
+        r"\b(?:Adresse|Address)[ \t]*[:\-][ \t]*([^\n\r]{5,160})",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        address = re.sub(r"\s+", " ", address_match.group(1)).strip(" .:-|")
+        if not address:
+            continue
+        if customer_anchor and address_match.start() >= customer_anchor.start():
+            if not hints["customer_address"]:
+                hints["customer_address"] = address
+        elif not hints["vendor_address"]:
+            hints["vendor_address"] = address
 
     customer_patterns = [
         r"Raison\s+Sociale?\s*[:;]\s*([^\n\r]{2,100})",
