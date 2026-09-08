@@ -107,6 +107,23 @@ class FastOCRTests(unittest.TestCase):
         self.assertEqual(extract_data.call_count, 1)
         self.assertGreater(extract_text.call_count, 0)
 
+    @patch.object(OptimizedOCRExtractor, "_extract_header_date_evidence", return_value="Date : 28-11-2019")
+    @patch.object(OptimizedOCRExtractor, "_extract_focused_regions", return_value=("Date : 20-14-2019", 0.55))
+    @patch("ocr_extractor.pytesseract.image_to_data", side_effect=RuntimeError("timeout"))
+    def test_fast_timeout_adds_header_date_evidence(
+        self, extract_data, extract_focused, extract_header
+    ):
+        instance = OptimizedOCRExtractor.__new__(OptimizedOCRExtractor)
+        instance.ocr_config = "--psm 4 -l fra+eng"
+
+        text, confidence = instance._fast_extract(np.zeros((1654, 2338), dtype=np.uint8))
+
+        self.assertEqual(confidence, 0.55)
+        self.assertIn("Date : 28-11-2019", text)
+        self.assertEqual(extract_data.call_count, 1)
+        self.assertEqual(extract_focused.call_count, 1)
+        self.assertEqual(extract_header.call_count, 1)
+
 
 if __name__ == "__main__":
     unittest.main()
