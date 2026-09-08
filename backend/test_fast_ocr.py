@@ -53,7 +53,7 @@ class FastOCRTests(unittest.TestCase):
         self.assertIn("Date : 28-11-2019", text)
         self.assertEqual(extract_header.call_count, 1)
         self.assertEqual(extract_header.call_args.kwargs["timeout"], 45)
-        self.assertIn("--psm 6", extract_header.call_args.kwargs["config"])
+        self.assertIn("--psm 4", extract_header.call_args.kwargs["config"])
 
     @patch("ocr_extractor.pytesseract.image_to_string", return_value="Date : 28-11-2019")
     @patch("ocr_extractor.pytesseract.image_to_data")

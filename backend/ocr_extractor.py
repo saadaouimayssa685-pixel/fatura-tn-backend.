@@ -222,7 +222,13 @@ class OptimizedOCRExtractor:
     def _extract_header_date_evidence(self, image):
         """Read the invoice header date without reprocessing the full scan."""
         height, width = image.shape[:2]
-        region = image[round(height * 0.14):round(height * 0.34), :round(width * 0.62)]
+        # Most conventional invoices place the number and date in the left
+        # header. Keeping this crop narrow prevents the client card and table
+        # from confusing the sparse-text layout engine on a small CPU.
+        region = image[
+            round(height * 0.17):round(height * 0.32),
+            round(width * 0.03):round(width * 0.50),
+        ]
         if region.size == 0:
             return ""
 
@@ -237,7 +243,7 @@ class OptimizedOCRExtractor:
             region = cv2.resize(region, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
         _, region = cv2.threshold(region, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
-        config = re.sub(r"--psm\s+\d+", "--psm 6", self.ocr_config)
+        config = re.sub(r"--psm\s+\d+", "--psm 4", self.ocr_config)
         fast_language = os.getenv("OCR_FAST_LANGUAGE", "eng").strip() or "eng"
         config = re.sub(r"-l\s+\S+", f"-l {fast_language}", config)
         try:
