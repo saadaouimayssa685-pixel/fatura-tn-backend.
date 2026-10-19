@@ -1,0 +1,82 @@
+.review-heading, .review-item-heading { display:flex; justify-content:space-between; align-items:center; gap:16px; }
+.review-heading { margin:20px 0; }
+.review-heading h1 { font-size:24px; overflow-wrap:anywhere; margin:0 0 8px; }
+.review-heading p { margin:0; color:#61738c; }
+.review-workspace { display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1fr); gap:24px; align-items:start; }
+.review-document { position:sticky; top:92px; min-width:0; border:1px solid #d5e0ef; background:#eaf0f6; border-radius:8px; overflow:hidden; }
+.review-image-scroll { max-height:calc(100vh - 160px); overflow:auto; padding:12px; }
+.review-image-page { position:relative; margin:0 auto; min-width:100%; line-height:0; background:white; }
+.review-image-page img { display:block; width:100%; height:auto; }
+.review-data { min-width:0; background:white; border:1px solid #d5e0ef; border-radius:8px; }
+.review-data > .tabs { margin:0; border-radius:8px 8px 0 0; display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); }
+.review-data > .tabs button { padding:14px 4px; min-width:0; font-size:13px; overflow-wrap:anywhere; }
+.review-field-group { padding:20px; border-bottom:1px solid #e2e8f0; }
+.review-field-group h2 { font-size:17px; margin:0 0 16px; }
+.review-field-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:16px; }
+.review-field-grid .wide-field { grid-column:1 / -1; }
+.review-field-grid label, .review-field label { font-size:13px; font-weight:600; display:block; margin-bottom:6px; }
+.review-field-grid input, .review-field-grid select { width:100%; min-width:0; padding:10px; border:1px solid #cdd9e9; border-radius:5px; background:#fbfcfe; color:#173657; font:inherit; font-size:14px; }
+.review-field-grid input:focus, .review-field-grid select:focus { outline:2px solid #2563eb; outline-offset:1px; }
+.review-field .field-proof { margin:5px 0 8px; display:block; }
+.review-field .field-proof-note { display:block; color:#687a90; font-size:11px; margin:4px 0; }
+.review-field .field-proof-heading { display:flex; justify-content:space-between; gap:8px; align-items:center; }
+.review-field .field-proof-heading small { font-size:11px; }
+.review-savebar { display:flex; flex-wrap:wrap; justify-content:flex-end; gap:10px; padding:16px; border-top:1px solid #d5e0ef; background:#f6f9fe; position:sticky; bottom:0; z-index:10; }
+.review-savebar button { font-size:13px; }
+.review-item { border:1px solid #dae3ef; padding:16px; border-radius:6px; margin-bottom:16px; }
+.review-item h3 { font-size:15px; margin:0 0 12px; }
+.review-item button, .review-item-heading > button { display:inline-flex; padding:7px; border:1px solid #d5e0ef; border-radius:4px; background:white; }
+.review-item details, .review-event details { margin-top:12px; font-size:13px; }
+.review-item p, .review-event p, .review-tax-list p { overflow-wrap:anywhere; }
+.review-event { border-bottom:1px solid #dde5ee; padding:16px 0; }
+.review-event p { font-size:13px; }
+.review-notice { border-left:3px solid #2563eb; background:#edf4ff; color:#193e70; padding:12px 16px; font-size:14px; margin:12px 0; }
+.review-notice p { margin-bottom:0; }
+.fatura-dialog { width:min(560px,calc(100vw - 32px)); max-height:85vh; overflow:auto; padding:24px; border:1px solid #cad8ea; border-radius:8px; color:#173657; }
+.fatura-dialog::backdrop { background:rgb(8 24 46 / 45%); }
+.fatura-dialog h2 { font-size:20px; }
+.fatura-dialog p { line-height:1.6; }
+.account-settings { max-width:900px; }
+.account-settings dl { display:grid; grid-template-columns:160px minmax(0,1fr); gap:14px; }
+.account-settings dd { margin:0; overflow-wrap:anywhere; }
+.app-shell.sidebar-collapsed { grid-template-columns:76px minmax(0,1fr); }
+.sidebar-collapsed > .sidebar { width:76px; padding-left:10px; padding-right:10px; }
+.sidebar-collapsed .sidebar .logo { max-width:56px; padding:0; justify-content:center; }
+.sidebar-collapsed .logo > span:not(.logo-mark) { display:none; }
+.sidebar-collapsed .side-nav { display:flex; flex-direction:column; }
+.sidebar-collapsed .side-nav button { justify-content:center; padding:12px; }
+.sidebar-collapsed .side-nav button span, .sidebar-collapsed .sidebar-user > div, .sidebar-collapsed .sidebar-subnav, .sidebar-collapsed .sidebar-primary-action { display:none; }
+.sidebar-collapsed .sidebar-user > button { font-size:0; justify-content:center; }
+.sidebar-collapsed .sidebar-user > button span { display:none; }
+.live-dashboard .live-metrics { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:16px; }
+.live-dashboard .live-metric { padding:22px; display:flex; gap:18px; align-items:center; text-align:left; background:white; border:1px solid #d5e0ef; border-top:3px solid #2563eb; border-radius:8px; color:#214d83; }
+.live-metric span { display:grid; gap:10px; }
+.live-metric strong { font-size:28px; color:#152d47; }
+.live-dashboard .live-metric.green { border-top-color:#159666; color:#159666; }
+.live-dashboard .live-metric.amber { border-top-color:#d78912; color:#b06c08; }
+.live-chart-grid { display:grid; grid-template-columns:1.3fr 1fr; gap:24px; }
+.live-chart-grid > section { min-width:0; padding:12px 0; }
+.live-chart-grid h3 { font-size:16px; }
+.live-status-legend { display:flex; justify-content:center; gap:16px; flex-wrap:wrap; font-size:13px; }
+.live-row { width:100%; padding:16px 8px; border:0; border-bottom:1px solid #d5e0ef; background:transparent; display:flex; justify-content:space-between; align-items:center; text-align:left; gap:16px; color:#173657; }
+.live-row:hover { background:#e9f1fc; }
+.live-row small { display:block; margin-top:5px; color:#61738c; }
+.live-row span { overflow-wrap:anywhere; }
+.invoice-review, .live-dashboard, .account-settings { letter-spacing:0; }
+@media(max-width:1100px) {
+  .review-field-grid { grid-template-columns:minmax(0,1fr); }
+  .review-workspace { gap:16px; }
+  .review-field-group { padding:16px; }
+}
+@media(max-width:760px) {
+  .sidebar-collapsed > .sidebar { position:sticky; top:0; height:100vh; }
+  .review-workspace { grid-template-columns:minmax(0,1fr); }
+  .review-document { position:relative; top:auto; }
+  .review-image-scroll { max-height:65vh; }
+  .review-heading { align-items:flex-start; flex-wrap:wrap; }
+  .review-heading h1 { font-size:20px; }
+  .live-dashboard .live-metrics, .live-chart-grid { grid-template-columns:minmax(0,1fr); }
+  .live-row { flex-wrap:wrap; }
+  .account-settings dl { grid-template-columns:minmax(0,1fr); gap:6px; }
+  .account-settings dd { margin-bottom:12px; }
+}

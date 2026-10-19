@@ -1,7 +1,9 @@
 import json
+import math
 import os
 import shutil
 import sqlite3
+from contextlib import contextmanager
 from typing import Any, Dict, List, Optional
 
 
@@ -15,8 +17,14 @@ class InvoiceStore:
         os.makedirs(documents_dir, exist_ok=True)
         self._init_db()
 
+    @contextmanager
     def _connect(self):
-        return sqlite3.connect(self.db_path)
+        connection = sqlite3.connect(self.db_path)
+        try:
+            with connection:
+                yield connection
+        finally:
+            connection.close()
 
     def _init_db(self):
         with self._connect() as connection:
@@ -179,6 +187,7 @@ class InvoiceStore:
     def update_invoice_data(self, invoice_id: int, normalized_data: Dict[str, Any], status: str = "draft") -> Dict[str, Any]:
         with self._connect() as connection:
             before_data = self._get_normalized_data(connection, invoice_id)
+            normalized_data = {**before_data, **normalized_data}
             connection.execute(
                 """
                 UPDATE invoices
@@ -218,6 +227,8 @@ class InvoiceStore:
                 )
                 normalized_data = before_data
             else:
+                # The form sends only editable fields, not the extracted product rows.
+                normalized_data = {**before_data, **normalized_data}
                 connection.execute(
                     """
                     UPDATE invoices
@@ -489,7 +500,6 @@ class InvoiceStore:
         supplier_name = (
             self._as_text(normalized_data.get("vendor_name"))
             or self._as_text(normalized_data.get("supplier_name"))
-            or self._as_text(normalized_data.get("customer_name"))
             or "Inconnu"
         )
         customer_name = self._as_text(normalized_data.get("customer_name"))
@@ -517,10 +527,10 @@ class InvoiceStore:
                 customer_name,
                 self._as_text(normalized_data.get("date") or normalized_data.get("invoice_date")),
                 self._as_text(normalized_data.get("due_date")),
-                self._as_float(normalized_data.get("subtotal")),
-                self._as_float(normalized_data.get("tax_amount")),
-                self._as_float(normalized_data.get("stamp_duty")),
-                self._as_float(normalized_data.get("total_amount")),
+                self._optional_number(normalized_data.get("subtotal")),
+                self._optional_number(normalized_data.get("tax_amount")),
+                self._optional_number(normalized_data.get("stamp_duty")),
+                self._optional_number(normalized_data.get("total_amount")),
                 self._as_text(normalized_data.get("currency")) or "TND",
                 invoice_id,
             ),
@@ -538,9 +548,9 @@ class InvoiceStore:
                 (
                     invoice_id,
                     self._as_text(item.get("description") or item.get("designation")),
-                    self._as_float(item.get("quantity")) or 1,
-                    self._as_float(item.get("unit_price")),
-                    self._as_float(item.get("total") or item.get("total_price")),
+                    self._optional_number(item.get("quantity")),
+                    self._optional_number(item.get("unit_price")),
+                    self._optional_number(item.get("total") if "total" in item else item.get("total_price")),
                 ),
             )
 
@@ -615,6 +625,16 @@ class InvoiceStore:
         if value is None:
             return ""
         return str(value).strip()
+
+    def _optional_number(self, value: Any) -> Optional[float]:
+        # Missing evidence is SQL NULL, not an observed zero or a default quantity.
+        if value is None or isinstance(value, bool):
+            return None
+        try:
+            number = float(str(value).strip().replace(" ", "").replace("\u00a0", "").replace("\u202f", "").replace(",", "."))
+        except (TypeError, ValueError):
+            return None
+        return number if math.isfinite(number) else None
 
     def _as_float(self, value: Any) -> float:
         if value is None:

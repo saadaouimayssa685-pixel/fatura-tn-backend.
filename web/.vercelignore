@@ -1,0 +1,15 @@
+# Deploy source only; production variables belong in the Vercel dashboard.
+.git
+.vercel
+node_modules
+dist
+.env
+.env.local
+.env.*.local
+*.log
+**/*.sqlite*
+**/*.db
+**/*.pem
+**/*.key
+qa-results
+tests

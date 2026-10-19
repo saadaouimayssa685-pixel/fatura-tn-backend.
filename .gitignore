@@ -27,3 +27,12 @@ data/
 # OS
 .DS_Store
 Thumbs.db
+
+# Local QA output can contain invoices, account data and SQLite backups.
+backend/qa-results/
+backend/qa-*.json
+# Private development and verification tools remain available locally.
+backend/qa_*.py
+backend/test_*.py
+web/tests/
+*.log

@@ -7,7 +7,7 @@ from typing import Dict, Tuple
 import cv2
 import numpy as np
 import pytesseract
-from PIL import Image
+from PIL import Image, ImageOps
 
 
 class OptimizedOCRExtractor:
@@ -20,7 +20,10 @@ class OptimizedOCRExtractor:
         if not os.path.isabs(configured_tessdata_dir):
             configured_tessdata_dir = os.path.join(project_root, configured_tessdata_dir)
         self.tessdata_dir = configured_tessdata_dir
-        self.base_ocr_config = f"-l fra+eng --tessdata-dir {self.tessdata_dir}"
+        self.languages = os.getenv("OCR_LANGUAGES", "fra+ara+eng")
+        # The Windows subprocess parser may preserve literal quotes in --tessdata-dir.
+        os.environ["TESSDATA_PREFIX"] = self.tessdata_dir
+        self.base_ocr_config = f"-l {self.languages}"
         self.ocr_config = f"--psm 6 {self.base_ocr_config}"
         self._configure_tesseract()
         self.fast_mode = os.getenv("OCR_FAST_MODE", "false").lower() == "true"
@@ -37,10 +40,23 @@ class OptimizedOCRExtractor:
             print(f"Tesseract OCR unavailable: {error}")
 
     def extract_text(self, image_path: str, method: str = "optimized") -> Tuple[str, float, Dict]:
+        paddle_error = None
+        if os.getenv("OCR_TEXT_ENGINE", "tesseract").lower() == "paddle":
+            try:
+                from paddle_text import PaddleTextExtractor
+                if not hasattr(self, "_paddle_text"):
+                    self._paddle_text = PaddleTextExtractor()
+                text, confidence, metadata = self._paddle_text.extract_text(image_path)
+                if text.strip():
+                    return text, confidence, metadata
+                paddle_error = "empty_output"
+            except Exception as error:
+                paddle_error = type(error).__name__
         text, confidence = self.extract_full_text(image_path)
         return text, confidence, {
             "method_used": "tesseract",
-            "engines_tried": ["tesseract"],
+            "engines_tried": (["paddle_text"] if paddle_error else []) + ["tesseract"],
+            **({"paddle_error": paddle_error, "fallback_used": True} if paddle_error else {}),
             "preprocessing": "grayscale_denoise_threshold",
         }
 
@@ -48,8 +64,16 @@ class OptimizedOCRExtractor:
         if not os.path.exists(image_path) or os.path.getsize(image_path) == 0:
             return "", 0.0
 
-        image = cv2.imread(image_path)
-        if image is None:
+        try:
+            # PIL applies the camera/scanner EXIF rotation before OpenCV sees
+            # the pixels. The uploaded source remains untouched.
+            with Image.open(image_path) as source:
+                source.load()
+                oriented = ImageOps.exif_transpose(source).convert("RGB")
+                image = cv2.cvtColor(np.asarray(oriented), cv2.COLOR_RGB2BGR)
+        except Exception:
+            image = cv2.imread(image_path)
+        if image is None or image.size == 0:
             return "", 0.0
 
         if self.fast_mode:
@@ -161,7 +185,7 @@ class OptimizedOCRExtractor:
 
         # English alone is much lighter on the 0.1 CPU hosted profile and is
         # sufficient for Latin invoice labels, references and TND totals.
-        fast_language = os.getenv("OCR_FAST_LANGUAGE", "eng").strip() or "eng"
+        fast_language = self.languages
         # PSM 4 preserves the separated rows of a totals block better than
         # the compact page mode used for a full scan. Operators can still
         # override it for a particular deployment without a code change.
@@ -224,6 +248,8 @@ class OptimizedOCRExtractor:
 
     def _extract_header_date_evidence(self, image):
         """Read the invoice header date without reprocessing the full scan."""
+        if image.ndim == 3:
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         height, width = image.shape[:2]
         # Most conventional invoices place the number and date in the left
         # header. Keeping this crop narrow prevents the client card and table
@@ -247,7 +273,7 @@ class OptimizedOCRExtractor:
         _, region = cv2.threshold(region, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
         config = re.sub(r"--psm\s+\d+", "--psm 4", self.ocr_config)
-        fast_language = os.getenv("OCR_FAST_LANGUAGE", "eng").strip() or "eng"
+        fast_language = self.languages
         config = re.sub(r"-l\s+\S+", f"-l {fast_language}", config)
         try:
             return pytesseract.image_to_string(
@@ -264,6 +290,8 @@ class OptimizedOCRExtractor:
 
     def _extract_focused_regions(self, image):
         """OCR small invoice regions separately after a hosted timeout."""
+        if image.ndim == 3:
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         height, width = image.shape[:2]
         regions = [
             # The vendor MF is usually small but crisp in the top-left block;
@@ -275,7 +303,7 @@ class OptimizedOCRExtractor:
             (image[round(height * 0.82):, :], 900),
         ]
         config = re.sub(r"--psm\s+\d+", "--psm 6", self.ocr_config)
-        fast_language = os.getenv("OCR_FAST_LANGUAGE", "eng").strip() or "eng"
+        fast_language = self.languages
         config = re.sub(r"-l\s+\S+", f"-l {fast_language}", config)
         if "-l " not in config:
             config = f"-l {fast_language} {config}"
@@ -400,12 +428,25 @@ class OptimizedOCRExtractor:
             pil_image = Image.fromarray(image_array)
             for config in configs:
                 try:
-                    text = pytesseract.image_to_string(pil_image, config=config).strip()
+                    data = pytesseract.image_to_data(
+                        pil_image, config=config, output_type=pytesseract.Output.DICT,
+                        timeout=max(10, int(os.getenv("OCR_TESSERACT_TIMEOUT", "40"))),
+                    )
+                    lines, confidences = {}, []
+                    for index, word in enumerate(data.get("text", [])):
+                        if not word.strip():
+                            continue
+                        key = tuple(data[name][index] for name in ("page_num", "block_num", "par_num", "line_num"))
+                        lines.setdefault(key, []).append(word.strip())
+                        word_confidence = float(data["conf"][index])
+                        if word_confidence > 0:
+                            confidences.append(word_confidence)
+                    text = "\n".join(" ".join(words) for words in lines.values())
+                    confidence = sum(confidences) / len(confidences) / 100 if confidences else 0.0
                 except Exception as error:
                     print(f"Tesseract text extraction error ({variant_name}): {error}")
                     continue
 
-                confidence = self._calculate_confidence(pil_image, config=config)
                 useful_chars = len([char for char in text if char.isalnum()])
                 score = useful_chars * max(confidence, 0.05)
 

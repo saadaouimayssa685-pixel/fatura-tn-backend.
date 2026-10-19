@@ -61,6 +61,7 @@ logs/
 tests/
 test_*.py
 *_test.py
+qa_*.py
 
 # Environment files
 .env.local
@@ -129,3 +130,14 @@ models/cache/
 *.temp
 temp/
 tmp/
+
+# Private local artifacts must never enter a deployment image.
+.env.*
+!.env.example
+**/qa-results
+qa-results/
+**/*.sqlite*
+**/*.db
+**/*.pem
+**/*.key
+.venv*/

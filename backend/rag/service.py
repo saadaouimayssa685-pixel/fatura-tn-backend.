@@ -8,6 +8,7 @@ from .embeddings import EmbeddingProvider, cosine_similarity
 from .postgres_store import PostgresRAGStore
 from .store import SQLiteRAGStore
 from postgres_file_store import PostgresFileStore
+from assistant_language import language_instruction, no_evidence, retrieval_question, normalize_text, answer_language
 
 
 class RAGService:
@@ -80,13 +81,14 @@ class RAGService:
             raise ValueError("Question is required")
 
         top_k = max(1, min(top_k, 20))
-        query_embedding = self.embeddings.embed(question)
+        search_question = retrieval_question(question)
+        query_embedding = self.embeddings.embed(search_question)
         chunks = self.store.get_chunks(document_id=document_id)
 
         scored_chunks: List[Dict[str, Any]] = []
         for chunk in chunks:
             semantic_score = cosine_similarity(query_embedding, chunk["embedding"])
-            lexical_score = self._lexical_score(question, chunk["chunk_text"])
+            lexical_score = self._lexical_score(search_question, chunk["chunk_text"])
             if lexical_score <= 0 and self.embeddings.backend != "sentence_transformers":
                 continue
             score = (semantic_score * 0.75) + (lexical_score * 0.25)
@@ -137,13 +139,15 @@ class RAGService:
 
     def _build_extractive_answer(self, question: str, chunks: List[Dict[str, Any]]) -> str:
         if not chunks:
-            return "Aucun contexte indexé ne permet de répondre à cette question."
+            return no_evidence(question)
 
         best = chunks[0]
         page = f" page {best['page_number']}" if best.get("page_number") else ""
+        if answer_language(question) == "ar":
+            return "تم العثور على مقاطع مرتبطة بالسؤال، لكن توليد الإجابة غير متاح حاليا. راجع المصادر أدناه."
         return (
             f"Passage le plus pertinent trouvé dans le document {best['document_id']}{page}. "
-            "Utilise les sources retournées pour générer une réponse finale avec un LLM."
+            "La génération de réponse est indisponible. Consultez les sources ci-dessous."
         )
 
     def _build_llm_prompt(self, question: str, chunks: List[Dict[str, Any]]) -> str:
@@ -152,7 +156,7 @@ class RAGService:
             for index, chunk in enumerate(chunks)
         )
         return (
-            "Réponds à la question uniquement avec le contexte fourni. "
+            language_instruction(question) + "Réponds à la question uniquement avec le contexte fourni. "
             "Si l'information n'est pas présente, dis que le document ne permet pas de répondre.\n\n"
             f"Question: {question}\n\n"
             f"Contexte:\n{context}"
@@ -178,6 +182,6 @@ class RAGService:
     def _tokens(self, value: str) -> List[str]:
         return [
             token
-            for token in re.findall(r"[\wÀ-ÿ]+", value.lower())
+            for token in re.findall(r"[\wÀ-ÿ]+", normalize_text(value))
             if len(token) > 1
         ]
