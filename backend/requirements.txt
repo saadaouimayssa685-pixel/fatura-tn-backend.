@@ -10,6 +10,7 @@ aiofiles==23.2.0
 opencv-python==4.8.1.78
 numpy==1.26.4
 requests==2.31.0
+filelock>=3.12
 pdfplumber>=0.11.0
 PyMuPDF>=1.24.0
 sentence-transformers>=3.0.0
@@ -24,8 +25,8 @@ tokenizers>=0.14.0
 accelerate>=0.20.0
 sentencepiece>=0.1.99
 protobuf>=3.20.0
-paddleocr
-paddlepaddle
+paddleocr>=3.7,<4
+paddlepaddle>=3.3,<4
 
 # Additional dependencies
 ultralytics

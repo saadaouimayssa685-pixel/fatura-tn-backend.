@@ -4,6 +4,28 @@ from invoice_rules import extract_invoice_table_text, filter_invoice_line_items
 
 
 class InvoiceLineRulesTests(unittest.TestCase):
+    def test_english_rows_without_printed_totals_are_not_invented_or_removed(self):
+        text = "Description | Qty | Unit Price\nStrategy food spend. | 1 | 91.01\nSubtotal 91.01"
+        table = extract_invoice_table_text(text)
+        rows, rejected = filter_invoice_line_items([
+            dict(description="Strategy food spend.", quantity=1, unit_price=91.01, total=None)], table)
+        self.assertEqual(rejected, [])
+        self.assertEqual(len(rows), 1)
+        self.assertIsNone(rows[0]["total"])
+        self.assertEqual(rows[0]["unit_price"], 91.01)
+
+    def test_printed_price_basis_survives_both_filter_passes(self):
+        text = "Designation Qte PU TTC Montant\nRouleau Cristal 1 6.000 6.000\nTOTAL TTC 6.600"
+        rows = [dict(description="Rouleau Cristal", quantity=1, unit_price=6, total=6)]
+        for _ in range(2):
+            rows, rejected = filter_invoice_line_items(rows, text, 6.6)
+            self.assertEqual(rows[0]["price_basis"], "TTC")
+
+    def test_total_ttc_does_not_imply_unit_price_ttc(self):
+        rows, _ = filter_invoice_line_items([dict(description="Rouleau Cristal", quantity=1, unit_price=6, total=6)],
+            "Designation Qte PU Montant\nRouleau Cristal 1 6.000 6.000\nTOTAL TTC 6.600", 6.6)
+        self.assertNotIn("price_basis", rows[0])
+
     def setUp(self):
         self.text = """FACTURE N: 00633
         Nom du Client : BRIDGE IMMOBILIERE

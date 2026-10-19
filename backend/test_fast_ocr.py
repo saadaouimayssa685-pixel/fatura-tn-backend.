@@ -5,6 +5,36 @@ from ocr_extractor import OptimizedOCRExtractor
 
 
 class FastOCRTests(unittest.TestCase):
+    @patch("ocr_extractor.pytesseract.image_to_string")
+    @patch("ocr_extractor.pytesseract.image_to_data")
+    def test_full_ocr_uses_one_call_for_text_and_score(self, data, text):
+        data.return_value = {"text": ["FACTURE", "001", "TOTAL", "12.600"],
+                             "conf": [90, 90, 90, 90], "page_num": [1] * 4,
+                             "block_num": [1] * 4, "par_num": [1] * 4, "line_num": [1, 1, 2, 2]}
+        instance = self.make_extractor()
+        instance.base_ocr_config = "-l fra+ara+eng"
+        result, score = instance._run_tesseract_best([("gray", np.zeros((50, 50), dtype=np.uint8))])
+        self.assertEqual(result, "FACTURE 001\nTOTAL 12.600")
+        self.assertEqual(score, .9)
+        self.assertEqual(data.call_count, 3)
+        text.assert_not_called()
+
+    @patch("ocr_extractor.pytesseract.image_to_string", return_value="15/11/2019")
+    def test_color_scan_header_and_fallback_are_grayscale(self, extract):
+        instance = self.make_extractor()
+        instance.ocr_config = "--psm 6 -l fra+ara+eng"
+        image = np.zeros((800, 600, 3), dtype=np.uint8)
+        self.assertEqual(instance._extract_header_date_evidence(image), "15/11/2019")
+        instance._extract_focused_regions(image)
+        self.assertEqual(extract.call_count, 6)
+        for call in extract.call_args_list:
+            self.assertEqual(np.asarray(call.args[0]).ndim, 2)
+
+    def make_extractor(self):
+        instance = OptimizedOCRExtractor.__new__(OptimizedOCRExtractor)
+        instance.languages = "fra+ara+eng"
+        return instance
+
     @patch("ocr_extractor.pytesseract.image_to_data")
     def test_single_pass_preserves_lines(self, extract):
         extract.return_value = {
@@ -13,7 +43,7 @@ class FastOCRTests(unittest.TestCase):
             "page_num": [1] * 5, "block_num": [1] * 5,
             "par_num": [1] * 5, "line_num": [0, 1, 1, 2, 2],
         }
-        instance = OptimizedOCRExtractor.__new__(OptimizedOCRExtractor)
+        instance = self.make_extractor()
         instance.ocr_config = "--psm 6"
         text, confidence = instance._fast_extract(np.zeros((30, 40), dtype=np.uint8))
         self.assertEqual(text, "FACTURE QA-1\nTOTAL 24,800")
@@ -30,7 +60,7 @@ class FastOCRTests(unittest.TestCase):
             "text": ["FACTURE"], "conf": [90], "page_num": [1],
             "block_num": [1], "par_num": [1], "line_num": [1],
         }
-        instance = OptimizedOCRExtractor.__new__(OptimizedOCRExtractor)
+        instance = self.make_extractor()
         instance.ocr_config = "--psm 6"
         with patch.dict("os.environ", {"OCR_FAST_REGION_MAX_DIMENSION": "1000"}, clear=False):
             instance._fast_extract(np.zeros((1654, 2338), dtype=np.uint8))
@@ -45,7 +75,7 @@ class FastOCRTests(unittest.TestCase):
             "text": ["FACTURE", "00633"], "conf": [90, 90], "page_num": [1, 1],
             "block_num": [1, 1], "par_num": [1, 1], "line_num": [1, 1],
         }
-        instance = OptimizedOCRExtractor.__new__(OptimizedOCRExtractor)
+        instance = self.make_extractor()
         instance.ocr_config = "--psm 4 -l fra+eng"
 
         text, _ = instance._fast_extract(np.zeros((1654, 2338), dtype=np.uint8))
@@ -62,7 +92,7 @@ class FastOCRTests(unittest.TestCase):
             "text": ["Date", ":", "20-14-2019"], "conf": [90, 90, 90], "page_num": [1] * 3,
             "block_num": [1] * 3, "par_num": [1] * 3, "line_num": [1] * 3,
         }
-        instance = OptimizedOCRExtractor.__new__(OptimizedOCRExtractor)
+        instance = self.make_extractor()
         instance.ocr_config = "--psm 4 -l fra+eng"
 
         text, _ = instance._fast_extract(np.zeros((1654, 2338), dtype=np.uint8))
@@ -72,7 +102,7 @@ class FastOCRTests(unittest.TestCase):
 
     @patch.object(OptimizedOCRExtractor, "_extract_header_date_evidence", return_value="Date : 28-11-2019")
     def test_header_date_retry_is_shared_by_full_ocr(self, extract_header):
-        instance = OptimizedOCRExtractor.__new__(OptimizedOCRExtractor)
+        instance = self.make_extractor()
 
         text, confidence = instance._append_header_date_evidence(
             "Date : 20-14-2019", 0.55, np.zeros((1654, 2338), dtype=np.uint8)
@@ -84,7 +114,7 @@ class FastOCRTests(unittest.TestCase):
 
     @patch("ocr_extractor.pytesseract.image_to_string", return_value="FACTURE QA-1")
     def test_timeout_uses_small_focused_regions(self, extract):
-        instance = OptimizedOCRExtractor.__new__(OptimizedOCRExtractor)
+        instance = self.make_extractor()
         instance.ocr_config = "--psm 4 -l fra+eng"
         text, confidence = instance._extract_focused_regions(np.zeros((1654, 2338), dtype=np.uint8))
 
@@ -97,7 +127,7 @@ class FastOCRTests(unittest.TestCase):
     @patch("ocr_extractor.pytesseract.image_to_string", return_value="FACTURE QA-1")
     @patch("ocr_extractor.pytesseract.image_to_data", side_effect=RuntimeError("timeout"))
     def test_fast_timeout_retries_with_focused_regions(self, extract_data, extract_text):
-        instance = OptimizedOCRExtractor.__new__(OptimizedOCRExtractor)
+        instance = self.make_extractor()
         instance.ocr_config = "--psm 4 -l fra+eng"
 
         text, confidence = instance._fast_extract(np.zeros((80, 100), dtype=np.uint8))
@@ -113,7 +143,7 @@ class FastOCRTests(unittest.TestCase):
     def test_fast_timeout_adds_header_date_evidence(
         self, extract_data, extract_focused, extract_header
     ):
-        instance = OptimizedOCRExtractor.__new__(OptimizedOCRExtractor)
+        instance = self.make_extractor()
         instance.ocr_config = "--psm 4 -l fra+eng"
 
         text, confidence = instance._fast_extract(np.zeros((1654, 2338), dtype=np.uint8))

@@ -27,3 +27,8 @@ data/
 # OS
 .DS_Store
 Thumbs.db
+
+# Local QA output can contain invoices, account data and SQLite backups.
+backend/qa-results/
+backend/qa-*.json
+*.log

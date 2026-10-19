@@ -5,13 +5,65 @@ import unittest
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
-from typing import List
+from typing import Any, Dict, List, Optional
+from models import InvoiceData, PaymentInfo
 from unittest.mock import MagicMock
 from postgres_invoice_store import PostgresInvoiceStore
 from postgres_invoice_store import json_dumps
 
 
 class RegressionTests(unittest.TestCase):
+    def test_columnar_quantity_is_not_defaulted_to_one(self):
+        tree = ast.parse(Path("main.py").read_text(encoding="utf-8-sig"))
+        names = {"safe_float", "extract_columnar_invoice_items"}
+        scope = {"re": re, "List": List, "Dict": Dict, "Any": Any}
+        exec(compile(ast.Module(body=[n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in names],
+                                type_ignores=[]), "main.py", "exec"), scope)
+        rows = scope["extract_columnar_invoice_items"](
+            "Designation Qte PU TTC Montant\nRouleau Cristal 2 6.000 12.000\nPinceau rond N6/5 SAP 3 6.000 18.000")
+        self.assertEqual([row["quantity"] for row in rows], [2, 3])
+        self.assertEqual(rows[1]["description"], "Pinceau rond N6/5 SAP")
+
+    def test_grounded_local_values_survive_rule_normalization(self):
+        tree = ast.parse(Path("main.py").read_text(encoding="utf-8-sig"))
+        names = {"safe_float", "normalize_money_amount", "normalize_invoice_data"}
+        module = ast.Module(body=[node for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name in names], type_ignores=[])
+        scope = {"re": re, "Any": Any, "Dict": Dict, "Optional": Optional, "InvoiceData": InvoiceData}
+        exec(compile(module, "main.py", "exec"), scope)
+        grounded = {
+            "invoice_number": "00633", "supplier_name": "BEN ABDELKADER",
+            "total_amount": 1260.6, "stamp_duty": 0.6,
+            "payment_method": "Especes", "amount_in_words": "Montant imprime",
+            "items": [{"description": "Article verifie", "quantity": 1, "total": 6}],
+        }
+        data = InvoiceData(additional_data={"ollama_result": grounded},
+            payment_info=PaymentInfo(method="Especes"))
+        rules = {"fields": {"invoice_number": "WRONG", "vendor_name": "Adresse",
+            "total_amount": 6, "stamp_duty": 1, "payment_method": "Cheque",
+            "vendor_phone": "22 629 288"}, "items": []}
+        result = scope["normalize_invoice_data"](data, "", rules)
+        self.assertEqual(result["invoice_number"], "00633")
+        self.assertEqual(result["vendor_name"], "BEN ABDELKADER")
+        self.assertEqual(result["total_amount"], 1260.6)
+        self.assertEqual(result["stamp_duty"], 0.6)
+        self.assertEqual(result["payment_method"], "Especes")
+        self.assertEqual(result["amount_in_words"], "Montant imprime")
+        self.assertEqual(result["vendor_phone"], "22 629 288")
+        self.assertEqual(result["items"], grounded["items"])
+
+    def test_money_labels_accept_blank_lines_and_montant(self):
+        tree = ast.parse(Path("main.py").read_text(encoding="utf-8-sig"))
+        module = ast.Module(body=[node for node in tree.body if isinstance(node, ast.FunctionDef)
+            and node.name in {"safe_float", "extract_labeled_money"}], type_ignores=[])
+        scope = {"re": re, "List": List}
+        exec(compile(module, "main.py", "exec"), scope)
+        extract = scope["extract_labeled_money"]
+        self.assertEqual(extract("Montant TTC\n\n12,600", [r"montant\s+ttc"]), 12.6)
+        self.assertEqual(extract("TVA (19%)\n\n5,503", [r"\btva\b"]), 5.503)
+        self.assertEqual(extract("TVA (19%)", [r"\btva\b"]), 0.0)
+        self.assertEqual(extract("Désignation | Quantité | Total HT\n6,000", [r"total\s+ht"]), 0.0)
+
     def test_total_parser_skips_a_table_header(self):
         tree = ast.parse(Path("main.py").read_text(encoding="utf-8-sig"))
         names = {"safe_float", "extract_labeled_money"}

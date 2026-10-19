@@ -129,3 +129,14 @@ models/cache/
 *.temp
 temp/
 tmp/
+
+# Private local artifacts must never enter a deployment image.
+.env.*
+!.env.example
+**/qa-results
+qa-results/
+**/*.sqlite*
+**/*.db
+**/*.pem
+**/*.key
+.venv*/

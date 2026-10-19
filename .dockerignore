@@ -9,3 +9,15 @@ frontend
 **/*.pyc
 **/node_modules
 **/.venv
+**/.venv*
+**/qa-results
+**/uploads
+**/*.sqlite*
+**/*.db
+**/*.log
+**/*.pem
+**/*.key
+**/.pytest_cache
+backend/qa-*.json
+web
+docs/screenshots

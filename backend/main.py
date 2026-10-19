@@ -27,7 +27,10 @@ from ocr_extractor import OptimizedOCRExtractor
 from pdf_extractor import PDFExtractor
 from rag import RAGService
 from ollama_analyzer import OllamaInvoiceAnalyzer
-from gemini_cloud import GeminiCloud
+from groq_analyzer import GroqInvoiceAnalyzer
+from extraction_retrieval import ExtractionRetriever
+from paddle_classifier import PaddleDocumentClassifier
+from glm_ocr import GLMOCRExtractor
 from invoice_rules import extract_invoice_table_text, filter_invoice_line_items
 from dotenv import load_dotenv
 
@@ -81,8 +84,9 @@ SEED_DEMO_USERS = os.getenv("SEED_DEMO_USERS", "true").lower() == "true"
 if REQUIRE_POSTGRES and not DATABASE_URL.startswith(("postgresql://", "postgres://")):
     raise RuntimeError("Configure DATABASE_URL with a persistent PostgreSQL database.")
 ENABLE_PADDLEOCR = os.getenv("ENABLE_PADDLEOCR", "false").strip().lower() in {"1", "true", "yes", "on"}
-ENABLE_GEMMA = os.getenv("ENABLE_GEMMA", "false").strip().lower() in {"1", "true", "yes", "on"}
 ENABLE_YOLO = os.getenv("ENABLE_YOLO", "true").strip().lower() in {"1", "true", "yes", "on"}
+ENABLE_SIGNATURE_DETECTOR = os.getenv("ENABLE_SIGNATURE_DETECTOR", "true").strip().lower() in {"1", "true", "yes", "on"}
+SIGNATURE_MODEL_ID = os.getenv("SIGNATURE_MODEL_ID", "mdefrance/yolos-tiny-signature-detection").strip()
 
 app = FastAPI(
     title="Optimized Invoice OCR API",
@@ -306,9 +310,10 @@ except Exception as database_error:
     rag_service = RAGService(database_url="", storage_dir=RAG_STORAGE_FOLDER, sqlite_db_path=RAG_DB_PATH)
     ACTIVE_DATABASE_BACKEND = "sqlite"
 ollama_analyzer = OllamaInvoiceAnalyzer()
-ai_analyzer = GeminiCloud()
+groq_analyzer = GroqInvoiceAnalyzer()
+extraction_retriever = ExtractionRetriever()
+glm_ocr = GLMOCRExtractor()
 fatura_dataset_store = FaturaDatasetStore(db_path=FATURA_DATASET_DB_PATH, zip_path=FATURA_DATASET_ZIP)
-gemma_analyzer = None
 model = None
 classes = {}
 if ENABLE_YOLO:
@@ -317,29 +322,12 @@ if ENABLE_YOLO:
     model = YOLO(YOLO_MODEL_PATH)
     classes = model.names
 
+signature_detector = None
+signature_detector_error = None
+
 # Initialiser PaddleOCR seulement si demandé. Son chargement peut être très long
 # sur un poste local et bloquer le démarrage de l'API.
-paddle_pipeline = None
-if ENABLE_PADDLEOCR:
-    try:
-        from paddleocr import PPChatOCRv4Doc
-
-        paddle_pipeline = PPChatOCRv4Doc()
-        print("✅ Pipeline PaddleOCR initialisé avec succès")
-    except Exception as e:
-        print(f"⚠️ Erreur initialisation PaddleOCR: {e}")
-
-
-def get_gemma_analyzer():
-    """Charge Gemma uniquement à la demande pour ne pas bloquer le démarrage."""
-    global gemma_analyzer
-    if not ENABLE_GEMMA:
-        raise RuntimeError("Gemma est désactivé. Active ENABLE_GEMMA=true pour charger le modèle local.")
-    if gemma_analyzer is None:
-        from gemma_analyzer import GemmaAnalyzer
-
-        gemma_analyzer = GemmaAnalyzer()
-    return gemma_analyzer
+paddle_pipeline = PaddleDocumentClassifier() if ENABLE_PADDLEOCR else None
 
 
 def validate_file(file: UploadFile) -> bool:
@@ -351,17 +339,55 @@ def is_pdf_file(file_path: str) -> bool:
     """Vérifie si le fichier est un PDF."""
     return Path(file_path).suffix.lower() == ".pdf"
 
+def enrich_payment_ocr(file_path: str, tesseract_text: str, metadata: Dict[str, Any]):
+    if re.search(r"\bfacture\b|\binvoice\b|فاتورة", tesseract_text, re.I) and not re.search(
+            r"pay[ée]e?\s+en\s+(?:esp[eèé]ces|ch[eèé]que)", tesseract_text, re.I):
+        try:
+            from payment_stamp_ocr import extract_payment_stamp
+            stamp = extract_payment_stamp(file_path, ocr_extractor.languages)
+            if stamp:
+                tesseract_text += "\n" + stamp["text"]
+                metadata["payment_stamp_evidence"] = stamp
+        except Exception as error:
+            metadata["payment_stamp_error"] = type(error).__name__
+    return tesseract_text
+
+
 def extract_document_text(file_path: str):
     """Extrait le texte d'une image ou d'un PDF avec les métadonnées associées."""
     if is_pdf_file(file_path):
         return pdf_extractor.extract_text(file_path)
 
-    return ocr_extractor.extract_text(file_path)
+    try:
+        tesseract_text, confidence, metadata = ocr_extractor.extract_text(file_path)
+    except Exception as error:
+        tesseract_text, confidence = "", 0.0
+        metadata = {"method_used": "none", "tesseract_error": type(error).__name__}
+    metadata.setdefault("engines_tried", ["tesseract"])
+    tesseract_text = enrich_payment_ocr(file_path, tesseract_text, metadata)
+    if metadata.get("method_used") == "paddle_text":
+        return tesseract_text, confidence, metadata
+    glm_text = ""
+    if glm_ocr.is_available():
+        metadata["engines_tried"].append("glm-ocr")
+        try:
+            glm_text = glm_ocr.extract(file_path)
+        except Exception as error:
+            metadata["glm_ocr_error"] = type(error).__name__
+    if glm_text:
+        # Keep both independent readings. RAG retrieves the best passage and
+        # the evidence guard still requires the final value to occur in OCR.
+        combined = f"=== GLM-OCR DOCUMENT ===\n{glm_text}\n=== TESSERACT OCR ===\n{tesseract_text}"
+        metadata.update({"method_used": "glm_ocr_plus_tesseract" if tesseract_text else "glm_ocr",
+                         "glm_ocr_characters": len(glm_text)})
+        metadata["score_kind"] = "tesseract_ocr_score_not_field_accuracy"
+        return combined, confidence, metadata
+    return tesseract_text, confidence, metadata
 
 def classify_invoice_text(text: str):
     """Classe un document comme facture à partir du texte extrait."""
     normalized_text = text.lower()
-    strong_keywords = ["facture", "invoice", "bon de livraison", "avoir"]
+    strong_keywords = ["facture", "invoice", "avoir"]
     weak_keywords = [
         "bill",
         "receipt",
@@ -395,7 +421,7 @@ def classify_invoice_text(text: str):
         "linkedin.com",
     ]
 
-    invoice_label_match = bool(re.search(r"\bfactu\s*re\b|\binvoice\b", normalized_text, flags=re.IGNORECASE))
+    invoice_label_match = bool(re.search(r"\bfactu\s*re\b|\binvoice\b|فاتورة", normalized_text, flags=re.IGNORECASE))
     strong_matches = sum(
         1
         for keyword in strong_keywords
@@ -427,6 +453,9 @@ def classify_invoice_text(text: str):
             r"\btax\b",
             r"\bdiscount\b",
             r"\btimbre\b",
+            r"المبلغ\s+الجملي",
+            r"القيمة\s+المضافة",
+            r"مجموع|الإجمالي|الاجمالي",
         ]
         if re.search(pattern, normalized_text, flags=re.IGNORECASE)
     )
@@ -463,11 +492,16 @@ def classify_invoice_text(text: str):
     # is still sufficient document evidence to enter extraction. It is kept
     # deliberately narrower than the generic "bon de livraison" signal.
     header_identity_evidence = invoice_label_match and invoice_number_match and fiscal_match and date_match
+    other_document_title = bool(re.search(
+        r"demande\s+d['’\s]*achat|bon\s+de\s+commande|purchase\s+order|"
+        r"\bdevis\b|\bquotation\b|pro\s*forma|طلب\s+شراء|عرض\s+سعر",
+        normalized_text,
+    ))
+    delivery_only = bool(re.search(r"bon\s+de\s+livraison|delivery\s+note", normalized_text)) and not invoice_label_match
     is_invoice = (
         (strong_matches > 0 and has_invoice_structure and negative_matches < 3)
-        or (weak_matches >= 4 and has_invoice_structure and negative_matches == 0)
         or (header_identity_evidence and negative_matches == 0)
-    )
+    ) and not other_document_title and not delivery_only
 
     confidence_score = 0.0
     if is_invoice:
@@ -481,6 +515,9 @@ def classify_invoice_text(text: str):
 
     return is_invoice, confidence_score, {
         "strong_keyword_matches": strong_matches,
+        "other_document_title": other_document_title or delivery_only,
+        "requires_type_review": not is_invoice and not other_document_title and not delivery_only and has_invoice_structure,
+        "score_kind": "decision_score_not_probability",
         "weak_keyword_matches": weak_matches,
         "negative_keyword_matches": negative_matches,
         "invoice_number_match": invoice_number_match,
@@ -554,40 +591,91 @@ def normalize_invoice_data(
     invoice_data: Optional[InvoiceData],
     extracted_text: str,
     rule_candidates: Optional[Dict[str, Any]] = None,
+    analysis_status: Optional[str] = None,
 ):
     """Convertit InvoiceData interne vers le format plat exploitable par la saisie."""
     fallback = (rule_candidates or {}).get("fields") or extract_invoice_fields_rag_assisted(extracted_text)[0]
     invoice_data = invoice_data or InvoiceData()
+    grounded_local = invoice_data.additional_data.get("ollama_result") or {}
+    cloud_fields = invoice_data.additional_data.get("cloud_result") or {}
+    cloud_mode = "cloud_result" in invoice_data.additional_data
+    local_key = {"date": "invoice_date", "vendor_name": "supplier_name", "vendor_address": "supplier_address",
+                 "vendor_tax_id": "supplier_tax_id", "vendor_phone": "supplier_phone", "vendor_email": "supplier_email",
+                 "vendor_registration_number": "supplier_registration_number"}
 
     fallback_invoice_number = str(fallback.get("invoice_number", "") or "").strip()
-    invoice_number = fallback_invoice_number if len(fallback_invoice_number) >= 3 else str(invoice_data.invoice_number or "").strip()
+    invoice_number = str(cloud_fields.get("invoice_number") or grounded_local.get("invoice_number") or "").strip() or (
+        fallback_invoice_number if len(fallback_invoice_number) >= 3 else str(invoice_data.invoice_number or "").strip()
+    )
     if invoice_number.upper() in {"A", "S", "SS"}:
+        invoice_number = ""
+    if cloud_mode:
+        invoice_number = str(cloud_fields.get("invoice_number") or "").strip()
+    elif "invoice_number" in grounded_local:
+        invoice_number = str(grounded_local.get("invoice_number") or "").strip()
+    if invoice_number.casefold() in {"invoice", "facture", "numero", "number", "n"}:
         invoice_number = ""
 
     def candidate_text(key: str, model_value: Any) -> str:
+        if cloud_mode:
+            return str(cloud_fields.get(key) or "").strip()
+        model_key = local_key.get(key, key)
+        if model_key in grounded_local:
+            return str(grounded_local[model_key] or "").strip()
+        verified = cloud_fields.get(key, grounded_local.get(local_key.get(key, key)))
+        if verified is not None and str(verified).strip():
+            return str(verified).strip()
         candidate = str(fallback.get(key, "") or "").strip()
         return candidate or str(model_value or "").strip()
 
     def candidate_money(key: str, model_value: Any) -> Optional[float]:
+        if cloud_mode:
+            return safe_float(cloud_fields[key]) if cloud_fields.get(key) is not None else None
+        if cloud_fields.get(key) is not None:
+            return safe_float(cloud_fields[key])
+        if key in grounded_local:
+            return safe_float(grounded_local[key]) if grounded_local[key] is not None else None
         candidate = safe_float(fallback.get(key))
         if candidate > 0:
             return candidate
         amount = normalize_money_amount(model_value, 0.0)
         return amount if amount > 0 else None
 
-    # Candidate rows are produced by OCR table rules.  Do not expose raw LLM
-    # rows: a model may be useful for deciding fields, never for inventing rows.
+    # Local rows have already passed quote/numeric grounding; table validation
+    # below still rejects non-article content and merges duplicate rule rows.
     if rule_candidates is not None:
         items = list(rule_candidates.get("items") or [])
     else:
         items = list(fallback.get("items") or [])
+    if grounded_local.get("items"):
+        items = list(grounded_local["items"]) + items
+    if cloud_mode:
+        cloud_items = list(cloud_fields.get("items") or [])
+        # A cloud model may omit rows on dense tables. Keep independently
+        # verified OCR rows and let the evidence guard reject false positives.
+        items = cloud_items + items
+        unique_items = []
+        seen_items = set()
+        for item in items:
+            key = (
+                _canonical_identifier(item.get("reference")),
+                _canonical_identifier(item.get("description")),
+                round(safe_float(item.get("total")), 3),
+            )
+            if key not in seen_items:
+                seen_items.add(key)
+                unique_items.append(item)
+        items = unique_items
 
     normalized = {
         "invoice_number": invoice_number,
         "date": candidate_text("date", invoice_data.invoice_date),
-        "due_date": invoice_data.due_date or "",
+        "due_date": candidate_text("due_date", invoice_data.due_date),
         "vendor_name": candidate_text("vendor_name", invoice_data.supplier.name if invoice_data.supplier else ""),
-        "vendor_address": invoice_data.supplier.address if invoice_data.supplier and invoice_data.supplier.address else "",
+        "vendor_address": candidate_text(
+            "vendor_address",
+            invoice_data.supplier.address if invoice_data.supplier else "",
+        ),
         "vendor_tax_id": (
             candidate_text("vendor_tax_id", invoice_data.supplier.vat_number)
             if invoice_data.supplier and invoice_data.supplier.vat_number
@@ -599,38 +687,60 @@ def normalize_invoice_data(
             else candidate_text("vendor_tax_id", invoice_data.supplier.registration_number if invoice_data.supplier else "")
         ),
         "vendor_phone": candidate_text("vendor_phone", invoice_data.supplier.phone if invoice_data.supplier else ""),
+        "vendor_email": candidate_text("vendor_email", invoice_data.supplier.email if invoice_data.supplier else ""),
+        "vendor_registration_number": candidate_text("vendor_registration_number",
+            invoice_data.supplier.registration_number if invoice_data.supplier else ""),
         "customer_name": candidate_text("customer_name", invoice_data.customer.name if invoice_data.customer else ""),
-        "customer_address": invoice_data.customer.address if invoice_data.customer and invoice_data.customer.address else "",
+        "customer_address": candidate_text(
+            "customer_address",
+            invoice_data.customer.address if invoice_data.customer else "",
+        ),
         "customer_tax_id": (
             candidate_text("customer_tax_id", invoice_data.customer.vat_number)
             if invoice_data.customer and invoice_data.customer.vat_number
             else candidate_text("customer_tax_id", "")
         ),
         "customer_phone": candidate_text("customer_phone", invoice_data.customer.phone if invoice_data.customer else ""),
+        "customer_email": candidate_text("customer_email", invoice_data.customer.email if invoice_data.customer else ""),
+        "customer_id": candidate_text("customer_id", invoice_data.customer.customer_id if invoice_data.customer else ""),
         "subtotal": candidate_money("subtotal", invoice_data.subtotal),
         "tax_amount": candidate_money("tax_amount", invoice_data.tax_amount),
-        "tax_rate": fallback.get("tax_rate", ""),
-        "stamp_duty": candidate_money("stamp_duty", None),
+        "tax_rate": candidate_text("tax_rate", ""),
+        "stamp_duty": candidate_money("stamp_duty", grounded_local.get("stamp_duty")),
         "total_amount": candidate_money("total_amount", invoice_data.total_amount),
         "currency": invoice_data.currency or fallback.get("currency") or "TND",
-        "payment_method": fallback.get("payment_method", ""),
-        "rib": fallback.get("rib", ""),
-        "amount_in_words": getattr(invoice_data, "amount_in_words", "") or fallback.get("amount_in_words", ""),
-        "notes": getattr(invoice_data, "notes", "") or fallback.get("notes", "") or fallback.get("amount_in_words", ""),
+        "payment_method": candidate_text("payment_method", invoice_data.payment_info.method if invoice_data.payment_info else ""),
+        "payment_terms": candidate_text("payment_terms", invoice_data.payment_info.terms if invoice_data.payment_info else ""),
+        "rib": candidate_text("rib", invoice_data.payment_info.bank_details if invoice_data.payment_info else ""),
+        "amount_in_words": candidate_text("amount_in_words", grounded_local.get("amount_in_words", "")),
+        "discount": candidate_money("discount", None),
+        "notes": candidate_text("notes", getattr(invoice_data, "notes", "")) or candidate_text("amount_in_words", ""),
         "items": items,
+        "taxes": list(grounded_local.get("taxes") or []),
+        "additional_data": {"item_discounts": invoice_data.additional_data.get("item_discounts", []),
+                            "evidence_adjustments": grounded_local.get("evidence_adjustments", [])},
     }
+    reverse_keys = {value: key for key, value in local_key.items()}
+    normalized["_review_fields"] = [reverse_keys.get(key, key) for key in grounded_local.get("requires_review_fields", [])]
+    normalized["_llm_abstained_fields"] = [reverse_keys.get(key, key) for key, value in grounded_local.items()
+                                           if value is None and key not in {"evidence", "items"}]
+    if analysis_status and analysis_status != "completed":
+        normalized["additional_data"]["llm_extraction_status"] = analysis_status
     return normalized
 
 
 EVIDENCE_GUARDED_FIELDS = {
     "invoice_number", "date", "vendor_name", "vendor_tax_id", "customer_name",
     "customer_tax_id", "vendor_phone", "customer_phone", "subtotal", "tax_amount",
-    "stamp_duty", "total_amount", "currency",
+    "stamp_duty", "total_amount", "currency", "vendor_address", "customer_address",
+    "payment_method", "rib", "amount_in_words", "due_date", "tax_rate",
+    "vendor_email", "customer_email", "payment_terms", "discount",
+    "vendor_registration_number", "customer_id",
 }
 
 
 def _canonical_identifier(value: Any) -> str:
-    return re.sub(r"[^a-z0-9]", "", str(value or "").lower())
+    return "".join(char for char in str(value or "").lower() if char.isalnum())
 
 
 def _canonical_date(value: Any) -> str:
@@ -651,20 +761,32 @@ def _money_values_in_text(text: str) -> List[float]:
 
 def value_has_ocr_support(field_name: str, value: Any, text: str) -> bool:
     """Require a proposed high-risk field to be traceable to OCR text."""
+    if field_name in {"subtotal", "tax_amount", "stamp_duty", "total_amount", "discount"}:
+        from extraction_guards import monetary_in_source
+        return monetary_in_source(field_name, value, text)
     if not field_has_value(field_name, value):
         return False
-    if field_name in {"subtotal", "tax_amount", "stamp_duty", "total_amount"}:
-        expected = safe_float(value)
-        return any(abs(candidate - expected) <= 0.005 for candidate in _money_values_in_text(text))
-    if field_name == "date":
-        expected = _canonical_date(value)
-        return bool(expected and expected in re.sub(r"[.\-]", "/", text or ""))
+    if field_name == "tax_rate":
+        from invoice_value_evidence import decimal_value
+        rate = re.fullmatch(r"\s*(\d{1,2}(?:[.,]\d+)?)\s*%\s*", str(value))
+        return bool(rate and any(decimal_value(rate[1]) == decimal_value(token) for token in re.findall(
+            r"(?:TVA|VAT|taux(?:\s+TVA)?)[\s|:()]*(\d{1,2}(?:[.,]\d+)?)\s*%", text or "", re.I)))
+    if field_name == "invoice_number" and str(value).casefold() in {"invoice", "facture", "number", "numero"}:
+        return False
+    if field_name in {"date", "due_date"}:
+        from extraction_guards import date_in_source
+        return date_in_source(value, text)
     if field_name == "currency":
+        if str(value).upper() == "EUR" and "\u20ac" in (text or ""):
+            return True
         return bool(re.search(rf"\b{re.escape(str(value).upper())}\b", text or "", flags=re.IGNORECASE))
+    if field_name in {"vendor_registration_number", "customer_id"}:
+        from identifier_evidence import identifier_spans
+        return bool(identifier_spans(field_name, value, text))
     expected = _canonical_identifier(value)
     observed = _canonical_identifier(text)
     if field_name in {"vendor_name", "customer_name"}:
-        tokens = [token for token in re.findall(r"[a-z0-9]{3,}", str(value).lower())]
+        tokens = re.findall(r"[^\W_]{3,}", str(value).lower(), flags=re.UNICODE)
         return bool(tokens and all(token in observed for token in tokens))
     return bool(expected and expected in observed)
 
@@ -674,29 +796,56 @@ def enforce_evidence_guard(
     extracted_text: str,
     field_evidence: Optional[Dict[str, Any]] = None,
     rule_candidates: Optional[Dict[str, Any]] = None,
+    cloud_evidence: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """Reject LLM/fallback values that cannot be found in OCR and return auditable proofs."""
     fallback = (rule_candidates or {}).get("fields") or extract_invoice_fields_fallback(extracted_text)
     guarded = dict(normalized_fields)
+    abstained = set(guarded.pop("_llm_abstained_fields", []))
+    review_fields = set(guarded.pop("_review_fields", []))
     proofs: Dict[str, Any] = {}
+    from extraction_guards import complete_tax_id, party_conflicts, named_party_contacts, corroborated_supplier_header
+    from invoice_value_evidence import ambiguous_monetary_row
 
     for field_name in EVIDENCE_GUARDED_FIELDS:
         value = guarded.get(field_name)
         supported = value_has_ocr_support(field_name, value, extracted_text)
+        visual_proof = (cloud_evidence or {}).get(field_name)
+        if visual_proof and visual_proof.get("value") == value and visual_proof.get("ocr_corroborated"):
+            supported = True
+        visual_proposal = visual_proof and visual_proof.get("value") == value and not visual_proof.get("ocr_corroborated")
         # A missing currency marker on a Tunisian invoice is common. Keep the
         # explicit workflow default while recording that it is not OCR-derived.
-        workflow_default_currency = field_name == "currency" and str(value or "").upper() == "TND"
-        if workflow_default_currency:
-            supported = True
-        if not supported:
-            fallback_value = fallback.get(field_name, "")
+        workflow_default_currency = field_name == "currency" and str(value or "").upper() == "TND" and not supported
+        if visual_proposal:
+            proofs[field_name] = {"value": value, "supported": False, "requires_review": True,
+                                  "source": {"type": "visual_model", **visual_proof}}
+            continue
+        if not supported and not workflow_default_currency:
+            fallback_value = fallback.get(field_name, "") if cloud_evidence is None and field_name not in abstained else ""
             if value_has_ocr_support(field_name, fallback_value, extracted_text):
                 guarded[field_name] = fallback_value
                 value = fallback_value
                 supported = True
             else:
-                guarded[field_name] = None if field_name in {"subtotal", "tax_amount", "stamp_duty", "total_amount"} else ""
+                guarded[field_name] = None if field_name in {"subtotal", "tax_amount", "stamp_duty", "total_amount", "discount"} else ""
                 value = guarded[field_name]
+        # Fallback amounts must pass the same ambiguity guard as LLM amounts.
+        # Run after fallback selection so a missing/failed batch cannot bypass it.
+        if supported and field_name in {"subtotal", "tax_amount", "stamp_duty", "total_amount"}:
+            ambiguity = ambiguous_monetary_row(
+                field_name, value, extracted_text, f"L1-L{len(extracted_text.splitlines())}",
+            )
+            if ambiguity:
+                guarded[field_name] = None
+                proofs[field_name] = {
+                    "value": None, "supported": False, "requires_review": True,
+                    "reason": ambiguity["reason"], "rejected_value": value,
+                    "source": {"type": "ocr_ambiguous_rows", "text": ambiguity["source"],
+                               "line_ids": ambiguity["line_ids"],
+                               "line_start": ambiguity["line_ids"][0], "line_end": ambiguity["line_ids"][-1]},
+                }
+                continue
         matching_chunk = next(
             (
                 chunk for chunk in (field_evidence or {}).get(field_name, [])
@@ -712,28 +861,113 @@ def enforce_evidence_guard(
                 "chunk_index": matching_chunk.get("chunk_index"),
                 "page_number": matching_chunk.get("page_number"),
                 "preview": matching_chunk.get("preview"),
+                "text": matching_chunk.get("text", ""),
+                "source_id": matching_chunk.get("source_id"),
+                "line_start": matching_chunk.get("line_start"),
+                "line_end": matching_chunk.get("line_end"),
+                "retrieval_method": matching_chunk.get("retrieval_method"),
+                **{key: matching_chunk.get(key) for key in (
+                    "chunk_id", "document_id", "page", "section", "bbox", "boxes", "line_ids", "page_line_ids",
+                    "ocr_confidence", "source_type", "layout_label", "parent_block_id",
+                    "coordinate_space", "bbox_format", "lexical_score", "semantic_score", "score")
+                   if key in matching_chunk},
             } if matching_chunk else ("ocr_text" if supported else None)),
         }
+        if field_name == "currency":
+            guarded["currency_extracted"] = value if supported else None
+            guarded["currency_source"] = "ocr" if supported else "workflow_default" if workflow_default_currency else None
+            proofs[field_name]["extracted_value"] = guarded["currency_extracted"]
+            proofs[field_name]["default_applied"] = workflow_default_currency
 
+    for key in ("vendor_tax_id", "customer_tax_id"):
+        if guarded.get(key) and not complete_tax_id(guarded[key], extracted_text):
+            guarded[key] = ""
+            proofs[key] = {"value": "", "supported": False, "requires_review": True,
+                           "reason": "incomplete_tax_identifier"}
+    for key in party_conflicts(guarded, extracted_text):
+        guarded[key] = ""
+        proofs[key] = {"value": "", "supported": False, "requires_review": True,
+                       "reason": "supplier_customer_conflict"}
+    header = corroborated_supplier_header(extracted_text)
+    if guarded.get("vendor_name") and header.get("fields") and _canonical_identifier(guarded["vendor_name"]) != _canonical_identifier(header["fields"]["vendor_name"]):
+        header = {}
+    for key, value in header.get("fields", {}).items():
+        if key == "vendor_name" and guarded.get(key) and _canonical_identifier(guarded[key]) != _canonical_identifier(value):
+            continue
+        guarded[key] = value
+        proofs[key] = {"value": value, "supported": True,
+                       "source": {"type": "ocr_party_block", "text": header["text"],
+                                  "line_start": header["line_start"], "line_end": header["line_end"]},
+                       "reason": "corroborated_company_header"}
+    # A unique name-labelled contact block is stronger than an unrelated stamp.
+    for party in ("vendor", "customer"):
+        block = named_party_contacts(guarded.get(party + "_name"), extracted_text)
+        for suffix, value in block.get("fields", {}).items():
+            key = party + "_" + suffix
+            guarded[key] = value
+            proofs[key] = {"value": value, "supported": True,
+                           "source": {"type": "ocr_party_block", "text": block["text"],
+                                      "line_start": block["line_start"], "line_end": block["line_end"]},
+                           "reason": "unique_explicit_party_contact_block"}
+    guarded["tax_id"] = guarded.get("vendor_tax_id", "")
     table_text = extract_invoice_table_text(extracted_text)
-    proposed_items = (
-        list((rule_candidates or {}).get("items") or [])
-        if rule_candidates is not None
-        else list(guarded.get("items") or [])
-    )
+    proposed_items = list(guarded.get("items") or ([] if cloud_evidence is not None else (rule_candidates or {}).get("items")) or [])
+    visual_rows = [row for row in proposed_items if str(row.get("source", "")).endswith("_visual")]
+    # Visual rows may fix missing OCR cells, but their own quotes are not independent evidence.
+    verification_text = (table_text or (extracted_text if visual_rows else "")) + "\n" + "\n".join(row.get("quote", "") for row in visual_rows)
     verified_items, rejected_items = filter_invoice_line_items(
         proposed_items,
-        table_text,
+        verification_text,
         guarded.get("total_amount"),
     )
     guarded["items"] = verified_items
+    from invoice_value_evidence import invoice_discount, item_discount, supported_tax
+    discount = invoice_discount(extracted_text)
+    guarded["discount_amount"] = discount["amount"] if discount else None
+    guarded["discount_rate"] = discount["rate"] if discount else None
+    guarded["discount"] = guarded["discount_amount"]
+    for key in ("discount", "discount_amount", "discount_rate"):
+        proofs[key] = {"value": guarded[key], "supported": bool(discount and guarded[key] is not None),
+                       "source": {"type": "ocr_discount_cell", **discount} if discount else None}
+    guarded.setdefault("additional_data", {})["item_discounts"] = [
+        {"item_index": index, "discount_rate": entry["rate"], "discount_amount": entry["amount"],
+         "source": entry["source"]}
+        for index, row in enumerate(verified_items) if (entry := item_discount(row, extracted_text)) is not None]
+    checked_taxes = []
+    rejected_taxes = []
+    for row in guarded.get("taxes") or []:
+        quote = row.get("source", "") if isinstance(row, dict) else ""
+        checked = supported_tax(row, quote) if isinstance(quote, str) and quote and quote in extracted_text else None
+        if checked is not None:
+            checked["line_ids"] = [i for i, line in enumerate(extracted_text.splitlines(), 1) if line == checked["source"]]
+            if checked not in checked_taxes:
+                checked_taxes.append(checked)
+        else:
+            rejected_taxes.append(row)
+    guarded["taxes"] = checked_taxes
+    proofs["taxes"] = {"value": checked_taxes, "supported": bool(checked_taxes) and not rejected_taxes,
+                       "requires_review": bool(rejected_taxes), "rejected": rejected_taxes,
+                       "source": "ocr_tax_rows" if checked_taxes else None}
+    for row in verified_items:
+        proposal = next((original for original in visual_rows if original.get("description") == row["description"]
+                         and safe_float(original.get("total")) == row["total"]), None)
+        if proposal:
+            row.update({key: proposal.get(key) for key in ("price_basis", "quote", "page", "reference", "requires_review")})
+            row.pop("confidence", None)
+    visual_review = any(row.get("requires_review") for row in verified_items)
     proofs["items"] = {
         "value": len(verified_items),
-        "supported": bool(verified_items),
-        "source": "ocr_table_rules" if verified_items else None,
-        "table_detected": bool(table_text),
+        "supported": bool(verified_items) and not visual_review,
+        "source": "visual_model" if visual_rows else "ocr_table_rules" if verified_items else None,
+        "requires_review": visual_review,
+        "table_detected": bool(table_text or visual_rows),
         "rejected": rejected_items,
     }
+    for field in review_fields:
+        key = field.split(":", 1)[0]
+        if key in proofs:
+            proofs[key]["requires_review"] = True
+            proofs[key]["reason"] = "llm_value_rejected_by_evidence_validation"
     return guarded, proofs
 
 
@@ -798,7 +1032,7 @@ def rank_chunks_for_field(text: str, field_name: str, top_k: int = 3) -> List[Di
 
 
 def field_has_value(field_name: str, value: Any) -> bool:
-    if field_name in {"subtotal", "tax_amount", "stamp_duty", "total_amount"}:
+    if field_name in {"subtotal", "tax_amount", "stamp_duty", "total_amount", "discount"}:
         return safe_float(value) > 0
     if field_name == "items":
         return bool(value)
@@ -843,9 +1077,9 @@ def extract_invoice_fields_rag_assisted(text: str):
     return assisted, evidence
 
 
-def get_invoice_field_evidence(extracted_text: str) -> Dict[str, Any]:
-    _, evidence = extract_invoice_fields_rag_assisted(extracted_text)
-    return evidence
+def get_invoice_field_evidence(extracted_text: str, ocr_metadata=None, layout_metadata=None, document_id=None) -> Dict[str, Any]:
+    return extraction_retriever.retrieve(extracted_text, ocr_metadata=ocr_metadata,
+                                        layout_metadata=layout_metadata, document_id=document_id)
 
 
 def extract_invoice_line_items_from_text(text: str) -> List[Dict[str, Any]]:
@@ -855,6 +1089,13 @@ def extract_invoice_line_items_from_text(text: str) -> List[Dict[str, Any]]:
     ressemblent a un tableau article/quantite/prix/total, et ignore les totaux
     de bas de page pour ne pas inventer des articles.
     """
+    from invoice_rules import extract_alternating_table_rows, extract_unit_table_rows
+    unit_rows = extract_unit_table_rows(text)
+    if unit_rows:
+        return filter_invoice_line_items(unit_rows, text)[0]
+    alternating = extract_alternating_table_rows(text)
+    if alternating:
+        return filter_invoice_line_items(alternating, text)[0]
     table_text = extract_invoice_table_text(text)
     if not table_text:
         table_start = re.search(r"\b(?:commande\s+client|bon\s+de\s+livraison\s+client)\b", text, flags=re.IGNORECASE)
@@ -1059,15 +1300,19 @@ def extract_columnar_invoice_items(table_text: str) -> List[Dict[str, Any]]:
         letters = re.search(r"[A-Za-zÀ-ÿ]{3,}", line)
         if not letters:
             continue
-        if matches:
-            description = line[: matches[0].start()].strip(" -:=|")
+        if len(matches) >= 2:
+            description = line[: matches[-2].start()].strip(" -:=|")
             description = re.sub(r"\s*\|\s*", " ", description)
             description = re.sub(r"^[^A-Za-zÀ-ÿ0-9]+", "", description)
             description = re.sub(rf"^(?:{reference_pattern})\s*", "", description, flags=re.IGNORECASE)
             description = re.sub(r"^[^A-Za-zÀ-ÿ0-9]+", "", description)
             # The OCR cell immediately before a monetary column is usually
             # quantity; it belongs to the numeric columns, not the label.
-            description = re.sub(r"\s+\d+(?:[,.]\d+)?$", "", description).strip()
+            quantity_match = re.search(r"\s+(\d+(?:[,.]\d+)?)$", description)
+            if not quantity_match:
+                continue
+            quantity = safe_float(quantity_match.group(1))
+            description = description[:quantity_match.start()].strip()
             if len(description) < 3:
                 continue
             amounts = [safe_float(match.group(0)) for match in matches]
@@ -1076,13 +1321,13 @@ def extract_columnar_invoice_items(table_text: str) -> List[Dict[str, Any]]:
                 continue
             inline_items.append({
                 "description": description[:180],
-                "quantity": 1,
+                "quantity": quantity,
                 "unit_price": amounts[-2] if len(amounts) > 1 else total,
                 "total": total,
                 "confidence": 0.72,
                 "source": "ocr_columnar_table",
             })
-        else:
+        elif not matches:
             pending_descriptions.append(line[:180])
 
     # When a complete row is already on one OCR line, its two monetary cells
@@ -1158,6 +1403,18 @@ def extract_amount_in_words(text: str) -> str:
         if amount_words_match and len(candidate) >= 8 and re.search(r"[A-Za-zÀ-ÿ]{3,}", candidate):
             return candidate[:240]
 
+    # OCR may place the amount-in-words line after the TTC label. In that
+    # layout it is outside the labelled block, so use a strict currency phrase.
+    direct_matches = re.finditer(
+        r"\b([A-Za-zÀ-ÿ][A-Za-zÀ-ÿ\s'\-]{2,100}?Dinars?(?:\(s\))?\s+et\s+[A-Za-zÀ-ÿ\s'\-]{2,80}?Millimes?(?:\(s\))?)\b",
+        normalized_text,
+        flags=re.IGNORECASE,
+    )
+    for direct_match in direct_matches:
+        candidate = re.sub(r"\s+", " ", direct_match.group(1)).strip(" .:-;")
+        if not re.search(r"\b(?:montant|total|cachet|signature)\b", candidate, flags=re.IGNORECASE):
+            return candidate[:240]
+
     return ""
 
 
@@ -1171,13 +1428,13 @@ def extract_labeled_money(text: str, labels: List[str], prefer: str = "last") ->
     if not text:
         return 0.0
 
-    lines = [re.sub(r"\s+", " ", line).strip(" |:;") for line in re.split(r"[\n\r]+", text)]
+    lines = [re.sub(r"\s+", " ", line).strip(" |:;") for line in re.split(r"[\n\r]+", text) if line.strip()]
     label_patterns = [re.compile(label, flags=re.IGNORECASE) for label in labels]
     amount_pattern = re.compile(
         r"(?:\d{1,3}(?:[ .]\d{3})+(?:,\d{1,3})?|\d+(?:[,.]\d{1,3})?)"
     )
     table_header_pattern = re.compile(
-        r"\b(?:code|reference|référence|article|designation|désignation|quantit[ée]|prix|unitaire|montant)\b",
+        r"\b(?:code|reference|référence|article|designation|désignation|quantit[ée]|prix|unitaire)\b",
         flags=re.IGNORECASE,
     )
     candidates: List[float] = []
@@ -1307,7 +1564,11 @@ def extract_party_hints(text: str) -> Dict[str, str]:
         address = re.sub(r"\s+", " ", address_match.group(1)).strip(" .:-|")
         if not address:
             continue
-        if customer_anchor and address_match.start() >= customer_anchor.start():
+        customer_address_scope = bool(
+            customer_anchor
+            and 0 <= address_match.start() - customer_anchor.end() <= 280
+        )
+        if customer_address_scope:
             if not hints["customer_address"]:
                 hints["customer_address"] = address
         elif not hints["vendor_address"]:
@@ -1360,7 +1621,7 @@ def extract_party_hints(text: str) -> Dict[str, str]:
 
     if not hints["vendor_name"]:
         for line in lines[:8]:
-            if re.search(r"\b(facture|date|mf|tel|fax|adresse|client|page)\b", line, flags=re.IGNORECASE):
+            if re.search(r"\b(facture|date|mf|tel|fax|adresse|client|page|duplicata|original|copie)\b", line, flags=re.IGNORECASE):
                 continue
             if re.search(r"[A-ZÀ-Ý]{3,}", line) and len(line) <= 80:
                 hints["vendor_name"] = line[:120]
@@ -1540,7 +1801,6 @@ def extract_invoice_fields_fallback(text: str):
         "subtotal": r"(?:sous[- ]?total(?:\s+ht)?|subtotal|total\s+ht|montant\s+ht|droits\s+et\s+taxes)\D{0,20}([0-9][0-9 \t.,]*)",
         "tax_amount": r"(?:tva|tax\s+amount)(?:\s+[0-9.,]+\s*%)?\D{0,15}([0-9][0-9 \t.,]*)",
         "stamp_duty": r"(?:timbre(?:\s+fiscal)?|stamp(?:\s+duty)?)\D{0,15}([0-9][0-9 \t.,]*)",
-        "discount": r"(?:remise|discount|rabais)\D{0,15}([0-9][0-9 \t.,]*)",
         "total_amount": r"(?:total\s+ttc|montant\s+ttc|net\s+à\s+payer|net\s+a\s+payer|total amount)\D{0,20}([0-9][0-9 \t.,]*)",
         "net_payable": r"(?:net\s+à\s+payer|net\s+a\s+payer|montant\s+à\s+payer|montant\s+a\s+payer)\D{0,20}([0-9][0-9 \t.,]*)",
         "payment_method": r"(?:mode\s+paiement|payment method)\s*[:\-]\s*(.+)",
@@ -1579,6 +1839,7 @@ def extract_invoice_fields_fallback(text: str):
         text,
         [
             r"\btotal\s+(?:net\s+)?h\.?\s*t\.?\b",
+            r"\btotal\s+hors\s+taxes\b",
             r"\bmontant\s+h\.?\s*t\.?\b",
             r"\bnet\s+h\.?\s*t\.?\b",
         ],
@@ -1586,7 +1847,8 @@ def extract_invoice_fields_fallback(text: str):
     )
     tax_amount = extract_labeled_money(text, [r"\bt\.?\s*v\.?\s*a\.?\b", r"\btax\s+amount\b"], prefer="last")
     stamp_duty = extract_labeled_money(text, [r"\btimbre(?:\s+fiscal)?\b", r"\bstamp\s+duty\b"], prefer="last")
-    discount = extract_labeled_money(text, [r"\bremise\b", r"\bdiscount\b", r"\brabais\b"], prefer="last")
+    from invoice_value_evidence import invoice_discount
+    discount = invoice_discount(text)
     total_amount = extract_labeled_money(
         text,
         [
@@ -1600,12 +1862,13 @@ def extract_invoice_fields_fallback(text: str):
     net_payable = extract_labeled_money(text, [r"\bnet\s+(?:à|a)\s+payer\b", r"\bmontant\s+(?:à|a)\s+payer\b"], prefer="max")
     if subtotal > 0:
         data["subtotal"] = subtotal
-    if tax_amount > 0:
-        data["tax_amount"] = tax_amount
+    # A percentage such as TVA (19%) is not a monetary amount.
+    data["tax_amount"] = tax_amount
     if stamp_duty > 0:
         data["stamp_duty"] = stamp_duty
-    if discount > 0:
-        data["discount"] = discount
+    data["discount"] = discount["amount"] if discount else 0.0
+    data["discount_amount"] = discount["amount"] if discount else None
+    data["discount_rate"] = discount["rate"] if discount else None
     if net_payable > 0:
         data["net_payable"] = net_payable
     if total_amount > 0:
@@ -1640,6 +1903,12 @@ def extract_invoice_fields_fallback(text: str):
             data["customer_name"] = f"{first_line} {second_line}"[:160]
 
     data["vendor_phone"] = extract_phone_near_labels(text, ["fournisseur", "vendeur", "seller", "supplier"], 0)
+    # An email in the issuer header is not the customer's email. Only use
+    # the part before an explicitly marked customer block.
+    issuer_header = re.split(r"\b(?:nom\s+du\s+client|client\s*[:;]|customer\s*[:;])", text, maxsplit=1, flags=re.I)[0]
+    emails = re.findall(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", issuer_header, flags=re.I)
+    unique_emails = {email.casefold(): email for email in emails}
+    data["vendor_email"] = next(iter(unique_emails.values())) if len(unique_emails) == 1 else ""
     data["customer_phone"] = extract_phone_near_labels(text, ["client", "acheteur", "buyer", "customer"], 1)
     tax_ids = extract_tax_ids_by_party(text)
     if not data["vendor_tax_id"]:
@@ -1664,6 +1933,20 @@ def extract_invoice_fields_fallback(text: str):
     data["items"] = extract_invoice_line_items_from_text(text)
     data["amount_in_words"] = extract_amount_in_words(text)
     data["notes"] = data["amount_in_words"]
+
+    # Payment is often handwritten near the stamp/signature and therefore
+    # absent from the printed "mode de paiement" label. Keep this bounded to
+    # explicit cash wording; never infer a payment method from a stamp alone.
+    cash_match = re.search(
+        r"\b(?:pay[ée]e?\s+en\s+esp[èe]ces|r[èe]glement\s+en\s+esp[èe]ces|en\s+esp[èe]ces)\b",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if cash_match:
+        negated = re.search(r"(?:non|pas(?:\s+encore)?)\s*$", text[max(0, cash_match.start() - 30):cash_match.start()], re.I)
+        if not negated:
+            data["payment_method"] = cash_match.group()
+            data["notes"] = "\n".join(filter(None, [data["amount_in_words"], cash_match.group()]))
 
     return data
 
@@ -1715,6 +1998,53 @@ async def save_upload_file(upload_file: UploadFile) -> str:
     return file_path
 
 
+def detect_signature_objects(file_path: str, confidence_threshold: float = 0.35) -> List[Dict[str, Any]]:
+    """Detecte les signatures manuscrites avec un modele Hugging Face dedie."""
+    global signature_detector, signature_detector_error
+    if not ENABLE_SIGNATURE_DETECTOR or is_pdf_file(file_path) or signature_detector_error:
+        return []
+    try:
+        if signature_detector is None:
+            from transformers import AutoImageProcessor, AutoModelForObjectDetection, pipeline
+            local_only = os.getenv("SIGNATURE_LOCAL_FILES_ONLY", "true" if not REQUIRE_POSTGRES else "false").lower() == "true"
+            processor = AutoImageProcessor.from_pretrained(SIGNATURE_MODEL_ID, local_files_only=local_only)
+            model = AutoModelForObjectDetection.from_pretrained(SIGNATURE_MODEL_ID, local_files_only=local_only)
+            signature_detector = pipeline("object-detection", model=model, image_processor=processor, device=-1)
+
+        from PIL import Image
+        with Image.open(file_path) as image:
+            image = image.convert("RGB")
+            image_width, image_height = image.size
+            predictions = signature_detector(image)
+
+        detections: List[Dict[str, Any]] = []
+        for prediction in predictions:
+            confidence = float(prediction.get("score", 0.0))
+            box = prediction.get("box") or {}
+            x1, y1 = float(box.get("xmin", 0.0)), float(box.get("ymin", 0.0))
+            x2, y2 = float(box.get("xmax", 0.0)), float(box.get("ymax", 0.0))
+            if confidence < confidence_threshold or x2 <= x1 or y2 <= y1:
+                continue
+            detections.append({
+                "class_id": 0,
+                "class_name": "signature",
+                "confidence": round(confidence, 4),
+                "detection_confidence": round(confidence, 4),
+                "bbox": {"x1": round(x1, 2), "y1": round(y1, 2), "x2": round(x2, 2), "y2": round(y2, 2),
+                         "width": round(x2 - x1, 2), "height": round(y2 - y1, 2)},
+                "normalized_bbox": {"x1": round(max(0.0, min(1.0, x1 / image_width)), 6),
+                                    "y1": round(max(0.0, min(1.0, y1 / image_height)), 6),
+                                    "x2": round(max(0.0, min(1.0, x2 / image_width)), 6),
+                                    "y2": round(max(0.0, min(1.0, y2 / image_height)), 6)},
+                "detector": SIGNATURE_MODEL_ID,
+            })
+        return detections
+    except Exception as error:
+        signature_detector_error = str(error)
+        print(f"Detection signature ignoree: {error}")
+        return []
+
+
 def detect_document_objects(file_path: str, confidence_threshold: float = 0.25) -> List[Dict[str, Any]]:
     """Detecte les objets/zones dans une image avec YOLO.
 
@@ -1731,22 +2061,48 @@ def detect_document_objects(file_path: str, confidence_threshold: float = 0.25) 
             if result.boxes is None:
                 continue
 
+            image_width = int(result.orig_shape[1])
+            image_height = int(result.orig_shape[0])
+
             for box in result.boxes:
                 class_id = int(box.cls[0]) if box.cls is not None else -1
                 confidence = float(box.conf[0]) if box.conf is not None else 0.0
                 xyxy = box.xyxy[0].tolist() if box.xyxy is not None else []
+                if len(xyxy) != 4 or image_width <= 0 or image_height <= 0:
+                    continue
+
+                x1, y1, x2, y2 = (float(value) for value in xyxy)
+                class_name = classes.get(class_id, str(class_id)) if classes else str(class_id)
 
                 detections.append(
                     {
                         "class_id": class_id,
-                        "class_name": classes.get(class_id, str(class_id)) if classes else str(class_id),
+                        "class_name": class_name,
                         "confidence": round(confidence, 4),
-                        "bbox": [round(float(value), 2) for value in xyxy],
+                        "detection_confidence": round(confidence, 4),
+                        "bbox": {
+                            "x1": round(x1, 2),
+                            "y1": round(y1, 2),
+                            "x2": round(x2, 2),
+                            "y2": round(y2, 2),
+                            "width": round(max(0.0, x2 - x1), 2),
+                            "height": round(max(0.0, y2 - y1), 2),
+                        },
+                        "normalized_bbox": {
+                            "x1": round(max(0.0, min(1.0, x1 / image_width)), 6),
+                            "y1": round(max(0.0, min(1.0, y1 / image_height)), 6),
+                            "x2": round(max(0.0, min(1.0, x2 / image_width)), 6),
+                            "y2": round(max(0.0, min(1.0, y2 / image_height)), 6),
+                        },
                     }
                 )
     except Exception as error:
         print(f"Detection objet ignoree: {error}")
 
+    signature_detections = detect_signature_objects(file_path)
+    for detection in signature_detections:
+        detection["class_id"] = len(detections)
+    detections.extend(signature_detections)
     return detections
 
 
@@ -1755,36 +2111,56 @@ def analyze_invoice_fields(
     model_choice: str,
     field_evidence: Optional[Dict[str, Any]] = None,
     rule_candidates: Optional[Dict[str, Any]] = None,
+    document_path: Optional[str] = None,
 ) -> tuple[Optional[InvoiceData], str, Dict[str, Any]]:
     """Analyse les champs de facture avec le modele choisi puis fallback regex."""
     invoice_data = None
     model_used = "fallback_regex"
     raw_data: Dict[str, Any] = {}
+    llm_diagnostics: Dict[str, Any] = {}
 
     try:
-        if model_choice == "local":
+        if model_choice == "groq":
+            invoice_data = groq_analyzer.analyze_invoice_text(
+                extracted_text, field_evidence=field_evidence, diagnostics=llm_diagnostics)
+            model_used = f"groq:{groq_analyzer.model_name}" if invoice_data else "fallback_regex"
+        elif model_choice == "local":
             invoice_data = ollama_analyzer.analyze_invoice_text(
                 extracted_text,
                 field_evidence=field_evidence,
                 rule_candidates=(rule_candidates or {}).get("llm_candidates"),
+                diagnostics=llm_diagnostics,
             )
             model_used = f"ollama:{ollama_analyzer.model_name}" if invoice_data else "fallback_regex"
         elif model_choice == "gemma":
-            invoice_data = get_gemma_analyzer().analyze_document(extracted_text)
-            model_used = "gemma"
-        elif model_choice == "fallback":
-            model_used = "fallback_regex"
-        else:
-            invoice_data = ai_analyzer.analyze_invoice_text(
+            # Compatibilite avec les anciens clients : Gemma est retire.
+            invoice_data = ollama_analyzer.analyze_invoice_text(
                 extracted_text,
                 field_evidence=field_evidence,
                 rule_candidates=(rule_candidates or {}).get("llm_candidates"),
+                diagnostics=llm_diagnostics,
             )
-            model_used = "gemini" if ai_analyzer.model else "fallback_regex"
+            model_used = f"ollama:{ollama_analyzer.model_name}" if invoice_data else "fallback_regex"
+        elif model_choice == "fallback":
+            model_used = "fallback_regex"
+        else:
+            # Legacy cloud model names are local aliases now. The document and
+            # OCR evidence never leave this host.
+            invoice_data = ollama_analyzer.analyze_invoice_text(
+                extracted_text,
+                field_evidence=field_evidence,
+                rule_candidates=(rule_candidates or {}).get("llm_candidates"),
+                diagnostics=llm_diagnostics,
+            )
+            model_used = f"ollama:{ollama_analyzer.model_name}" if invoice_data else "fallback_regex"
     except Exception as analysis_error:
         print(f"Analyse IA indisponible, fallback regex: {analysis_error}")
         raw_data["analysis_error"] = str(analysis_error)
 
+    if llm_diagnostics:
+        raw_data["llm"] = llm_diagnostics
+        if llm_diagnostics.get("status") != "completed":
+            raw_data["analysis_error"] = f"{llm_diagnostics.get('provider', 'local')}_llm_{llm_diagnostics.get('status', 'unavailable')}"
     return invoice_data, model_used, raw_data
 
 
@@ -1859,24 +2235,14 @@ def choose_agent_model(
     extraction_confidence: float,
     classification_confidence: float,
 ) -> tuple[str, str]:
-    """Route LLM extraction without forcing cloud use for every document."""
+    """Choose a configured provider while keeping explicit local requests offline."""
     normalized_choice = (requested_model or "local").strip().lower()
     if normalized_choice != "auto":
         return normalized_choice, "model_explicitly_requested"
 
-    text_length = len(extracted_text or "")
-    if text_length < AGENT_POLICY["minimum_text_length"]:
-        return "fallback", "text_too_short_for_llm_extraction"
-
-    difficult_document = (
-        extraction_confidence < AGENT_POLICY["low_ocr_confidence"]
-        or classification_confidence < AGENT_POLICY["uncertain_classification"]
-        or text_length > 6000
-    )
-    if difficult_document and getattr(ai_analyzer, "model", None):
-        return "gemini", "complex_or_uncertain_document_cloud_llm"
-
-    return "local", "standard_document_local_llm"
+    if os.getenv("INVOICE_LLM_PROVIDER", "local").strip().lower() == "groq":
+        return "groq", "configured_groq_retrieved_evidence_only"
+    return "local", "local_glm_ocr_rag_and_ollama_extraction"
 
 
 def validate_normalized_invoice_fields(
@@ -1885,6 +2251,20 @@ def validate_normalized_invoice_fields(
 ) -> List[Dict[str, Any]]:
     """Run deterministic business checks after extraction and normalization."""
     issues: List[Dict[str, Any]] = []
+
+    analysis_status = (normalized_fields.get("additional_data") or {}).get("llm_extraction_status")
+    if analysis_status and analysis_status != "completed":
+        issues.append({"code": "llm_extraction_incomplete", "severity": "blocking",
+                       "message": "Extraction LLM incomplete : reprendre l'analyse ou verifier les champs manuellement.",
+                       "status": analysis_status})
+
+    for field_name, proof in (field_proofs or {}).items():
+        if proof.get("requires_review"):
+            evidence_review = proof.get("reason") in {
+                "llm_value_rejected_by_evidence_validation", "ambiguous_adjacent_monetary_cells",
+            }
+            issues.append({"code": f"{'evidence' if evidence_review else 'visual'}_review_{field_name}", "severity": "blocking",
+                           "message": f"Preuve de '{field_name}' a verifier sur le document original."})
 
     for field_name in AGENT_POLICY["required_invoice_fields"]:
         if not field_has_value(field_name, normalized_fields.get(field_name)):
@@ -1898,7 +2278,8 @@ def validate_normalized_invoice_fields(
 
     for field_name in AGENT_POLICY["required_invoice_fields"]:
         proof = (field_proofs or {}).get(field_name, {})
-        if field_has_value(field_name, normalized_fields.get(field_name)) and not proof.get("supported"):
+        workflow_currency = field_name == "currency" and proof.get("source") == "workflow_default_tnd" and proof.get("default_applied")
+        if field_has_value(field_name, normalized_fields.get(field_name)) and not proof.get("supported") and not workflow_currency:
             issues.append(
                 {
                     "code": f"unproven_{field_name}",
@@ -1908,6 +2289,9 @@ def validate_normalized_invoice_fields(
             )
 
     currency = str(normalized_fields.get("currency") or "").strip().upper()
+    if (field_proofs or {}).get("currency", {}).get("default_applied"):
+        issues.append({"code": "currency_workflow_default", "severity": "warning",
+                       "message": "TND is the workflow default, not a currency read on the document."})
     if currency and currency != "TND":
         issues.append(
             {
@@ -1927,28 +2311,18 @@ def validate_normalized_invoice_fields(
             }
         )
 
-    subtotal = safe_float(normalized_fields.get("subtotal"))
-    tax_amount = safe_float(normalized_fields.get("tax_amount"))
-    stamp_duty = safe_float(normalized_fields.get("stamp_duty"))
-    total_amount = safe_float(normalized_fields.get("total_amount"))
+    from financial_validation import financial_validation_issues
+
     items = list(normalized_fields.get("items") or [])
-    if total_amount > 0 and subtotal <= 0:
+    if normalized_fields.get("total_amount") is not None and normalized_fields.get("subtotal") is None:
         issues.append(
             {
                 "code": "missing_subtotal_for_total",
-                "severity": "blocking",
-                "message": "TTC was found, but no OCR-proven HT amount was found. Do not infer it from TTC.",
+                "severity": "warning" if items and all(item.get("price_basis") == "TTC" for item in items) else "blocking",
+                "message": "TTC was found, but no source-proven HT amount was found. Do not infer it from TTC.",
             }
         )
-    if subtotal > 0 and tax_amount <= 0:
-        issues.append(
-            {
-                "code": "tax_amount_not_detected",
-                "severity": "warning",
-                "message": "HT is available but no OCR-proven TVA amount was found.",
-            }
-        )
-    if total_amount > 0 and (field_proofs or {}).get("items", {}).get("table_detected") and not items:
+    if normalized_fields.get("total_amount") is not None and (field_proofs or {}).get("items", {}).get("table_detected") and not items:
         issues.append(
             {
                 "code": "no_verified_line_items",
@@ -1956,36 +2330,7 @@ def validate_normalized_invoice_fields(
                 "message": "An article table was detected but no row passed the OCR structure and arithmetic rules.",
             }
         )
-    if items and total_amount > 0:
-        items_total = sum(safe_float(item.get("total")) for item in items)
-        if items_total > total_amount + AGENT_POLICY["math_tolerance_tnd"]:
-            issues.append(
-                {
-                    "code": "line_items_exceed_total",
-                    "severity": "blocking",
-                    "message": "The verified item lines exceed TTC; the document requires human review.",
-                    "metadata": {"items_total": round(items_total, 3), "total_amount": total_amount},
-                }
-            )
-    if subtotal > 0 and total_amount > 0:
-        expected_total = subtotal + tax_amount + stamp_duty
-        delta = abs(expected_total - total_amount)
-        if tax_amount > 0 and delta > AGENT_POLICY["math_tolerance_tnd"]:
-            issues.append(
-                {
-                    "code": "invoice_total_math_mismatch",
-                    "severity": "blocking",
-                    "message": "HT + TVA + timbre does not match TTC within the configured TND tolerance.",
-                    "metadata": {
-                        "subtotal": subtotal,
-                        "tax_amount": tax_amount,
-                        "stamp_duty": stamp_duty,
-                        "expected_total": round(expected_total, 3),
-                        "total_amount": total_amount,
-                        "delta": round(delta, 3),
-                    },
-                }
-            )
+    issues.extend(financial_validation_issues(normalized_fields, field_proofs))
 
     return issues
 
@@ -2074,6 +2419,9 @@ async def run_document_agent(
     agent_actions: List[Dict[str, Any]] = []
 
     try:
+        provider, _ = choose_agent_model(model_choice, "", 0, 0)
+        if provider == "groq" and not groq_analyzer.is_available():
+            raise HTTPException(status_code=503, detail="Groq non configure : ajoutez GROQ_API_KEY dans le .env du backend, puis redemarrez le serveur.")
         if not validate_file(file):
             raise HTTPException(
                 status_code=400,
@@ -2149,6 +2497,13 @@ async def run_document_agent(
             )
 
         is_invoice, classification_confidence, classification_details = classify_invoice_text(extracted_text)
+        if paddle_pipeline is not None:
+            is_invoice, classification_confidence, classification_details = await run_in_threadpool(
+                paddle_pipeline.classify, file_path, extracted_text,
+                (is_invoice, classification_confidence, classification_details),
+            )
+        else:
+            classification_details["analysis_method"] = "text_ocr_classification_fallback"
         document_type = "invoice" if is_invoice else "other"
         add_agent_decision(
             agent_decisions,
@@ -2209,7 +2564,9 @@ async def run_document_agent(
         selected_model_choice = model_choice or "local"
 
         if is_invoice and extracted_text.strip():
-            field_evidence = get_invoice_field_evidence(extracted_text)
+            field_evidence = await run_in_threadpool(get_invoice_field_evidence, extracted_text,
+                                                   extraction_metadata, classification_details,
+                                                   hashlib.sha256(content).hexdigest())
             add_agent_decision(
                 agent_decisions,
                 step="rag_extraction",
@@ -2217,6 +2574,7 @@ async def run_document_agent(
                 reason="Temporary chunks were ranked per target field before structured extraction.",
                 action="continue_to_field_extraction",
                 metadata={
+                    "retrieval_method": extraction_retriever.backend,
                     "fields_with_evidence": [
                         field_name
                         for field_name, chunks in field_evidence.items()
@@ -2265,7 +2623,7 @@ async def run_document_agent(
             )
 
             invoice_data, model_used, analysis_raw = await run_in_threadpool(
-                analyze_invoice_fields, extracted_text, selected_model_choice, field_evidence, rule_candidates
+                analyze_invoice_fields, extracted_text, selected_model_choice, field_evidence, rule_candidates, file_path
             )
             add_agent_decision(
                 agent_decisions,
@@ -2276,12 +2634,38 @@ async def run_document_agent(
                 metadata={"requested_model": model_choice, "selected_model": selected_model_choice, "model_used": model_used},
             )
 
-            normalized_fields = normalize_invoice_data(invoice_data, extracted_text, rule_candidates)
+            normalized_fields = normalize_invoice_data(
+                invoice_data, extracted_text, rule_candidates,
+                analysis_status=(analysis_raw.get("llm") or {}).get("status")
+                    or ("error" if analysis_raw.get("analysis_error") else None),
+            )
             normalized_fields, field_proofs = enforce_evidence_guard(
-                normalized_fields, extracted_text, field_evidence, rule_candidates
+                normalized_fields, extracted_text, field_evidence, rule_candidates,
+                invoice_data.additional_data.get("cloud_evidence") if invoice_data else None,
             )
             missing_fields = missing_required_invoice_fields(normalized_fields)
             validation_issues = validate_normalized_invoice_fields(normalized_fields, field_proofs)
+            # Automatic mode remains fully local. If validation is incomplete,
+            # values stay empty and the form asks for human review.
+            if (model_choice or "").lower() == "auto" and selected_model_choice == "local":
+                needs_cloud = invoice_data is None or bool(missing_fields) or any(
+                    issue.get("severity") == "blocking" for issue in validation_issues
+                )
+                if needs_cloud:
+                    add_agent_decision(agent_decisions, "local_quality_gate", "human_review_required",
+                                       "Local evidence is incomplete; unsupported values remain empty instead of invoking cloud.")
+            try:
+                from field_locations import locate_image_fields, locate_paddle_fields
+                if extraction_metadata.get("method_used") == "paddle_text":
+                    locations = locate_paddle_fields(extraction_metadata.get("lines", []), normalized_fields, field_proofs)
+                else:
+                    locations = await run_in_threadpool(
+                        locate_image_fields, file_path, normalized_fields, ocr_extractor.ocr_config, value_has_ocr_support
+                    )
+                for key, location in locations.items():
+                    field_proofs.setdefault(key, {"value": normalized_fields.get(key)})["location"] = location
+            except Exception as location_error:
+                add_agent_decision(agent_decisions, "field_locations", "unavailable", type(location_error).__name__)
             blocking_validation_issues = [
                 issue for issue in validation_issues if issue.get("severity") == "blocking"
             ]
@@ -2514,6 +2898,12 @@ async def run_document_agent(
                 "details": classification_details,
             },
             "invoice": invoice_record,
+            "extraction": {
+                "model_used": model_used,
+                "error": analysis_raw.get("analysis_error"),
+                "diagnostics": analysis_raw.get("llm"),
+                "document_sent_to_cloud": False,
+            },
             "rag_document": rag_document,
             "object_detections": detections,
             "agent": {
@@ -2543,7 +2933,6 @@ async def root():
         "features": [
             "OCR optimisé avec préprocessing avancé",
             "Analyse IA avec Gemini AI",
-            "Analyse IA avec google/gemma-3-4b-it",
             "Extraction PDF native avec pdfplumber et fallback OCR",
             "Vérification de facture avec PaddleOCR layout analysis",
             "Extraction d'entités avec modèle YOLO personnalisé",
@@ -2552,7 +2941,6 @@ async def root():
         ],
         "endpoints": {
             "upload": "/extract-invoice",
-            "upload_gemma": "/extract-invoice-gemma",
             "verify_invoice": "/verify-invoice",
             "extract_entities": "/extract-entities",
             "extract_entities_with_ocr": "/extract-entities-with-ocr",
@@ -2640,11 +3028,14 @@ async def health_check():
         "services": {
             "ocr": "optimized_tesseract",
             "pdf_extractor": "pdfplumber_with_ocr_fallback",
-            "ai_analyzer": "available" if ai_analyzer.model else "fallback",
+            "cloud_ai": "disabled",
+            "glm_ocr": "available" if glm_ocr.is_available() else "model_not_installed",
+            "glm_ocr_model": glm_ocr.model_name,
             "ollama_analyzer": "available" if ollama_analyzer.is_available() else "unavailable",
             "ollama_model": ollama_analyzer.model_name,
-            "gemma_analyzer": "disabled" if not ENABLE_GEMMA else ("available" if gemma_analyzer and gemma_analyzer.model else "lazy"),
             "paddle_pipeline": "available" if paddle_pipeline is not None else "unavailable",
+            "paddle_classification": paddle_pipeline.status() if paddle_pipeline is not None else {"status": "disabled"},
+            "extraction_retrieval": extraction_retriever.backend,
             "yolo_model": "available" if model else "unavailable",
             "database": ACTIVE_DATABASE_BACKEND,
             "auth_store": "postgresql" if DATABASE_URL else "sqlite",
@@ -2656,6 +3047,53 @@ async def health_check():
         },
         "version": "2.0.0"
     }
+
+
+@app.get("/models/status")
+async def local_models_status():
+    """Expose the two local model roles used by the document pipeline."""
+    return {
+        "cloud_enabled": False,
+        "ocr": {"provider": "ollama", "model": glm_ocr.model_name,
+                "available": glm_ocr.is_available(), "role": "image_and_table_transcription"},
+        "decision": {"provider": "ollama", "model": ollama_analyzer.model_name,
+                     "available": ollama_analyzer.is_available(), "role": "rag_grounded_structured_extraction"},
+        "pipeline": ["image_preprocessing", "glm_ocr+tesseract", "paddle_layout_classification",
+                     "rag_retrieval", "ollama_decision", "evidence_guard"],
+    }
+
+
+@app.post("/models/glm-ocr/extract")
+async def extract_with_glm_ocr(file: UploadFile = File(...)):
+    """Test GLM-OCR transcription independently without writing an invoice."""
+    if not validate_file(file):
+        raise HTTPException(status_code=400, detail="Format de document non supporte.")
+    content = await file.read()
+    if len(content) > MAX_FILE_SIZE:
+        raise HTTPException(status_code=413, detail="Document trop volumineux.")
+    await file.seek(0)
+    path = await save_upload_file(file)
+    try:
+        if is_pdf_file(path):
+            raise HTTPException(status_code=400, detail="GLM-OCR direct attend une image; utilisez le pipeline pour un PDF.")
+        if not glm_ocr.is_available():
+            raise HTTPException(status_code=503, detail=f"Modele {glm_ocr.model_name} non installe dans Ollama.")
+        from starlette.concurrency import run_in_threadpool
+        try:
+            text = await run_in_threadpool(glm_ocr.extract, path)
+        except Exception as error:
+            raise HTTPException(status_code=503, detail=f"GLM-OCR indisponible: {type(error).__name__}") from None
+        return {"success": bool(text), "model": glm_ocr.model_name, "text": text,
+                "characters": len(text), "stored": False}
+    finally:
+        if os.path.exists(path):
+            os.remove(path)
+
+
+@app.post("/models/ollama/extract-invoice")
+async def extract_invoice_with_local_models(file: UploadFile = File(...)):
+    """Run the complete local OCR, RAG and structured-decision pipeline."""
+    return await run_document_agent(file=file, model_choice="local", index_for_rag=True, detect_objects=True)
 
 
 @app.post("/dataset/fatura/import")
@@ -2721,7 +3159,7 @@ async def extract_invoice_data(
     Args:
         file: Fichier image de la facture
         include_raw_text: Inclure le texte brut dans la réponse
-        return_gemini_json: Inclure le JSON Gemini structuré dans la réponse
+        return_gemini_json: Paramètre historique ignoré; le traitement est entièrement local
     
     Returns:
         OCRResponse avec les données extraites et structurées
@@ -2765,9 +3203,13 @@ async def extract_invoice_data(
         
         print(f"✅ Texte extrait: {len(extracted_text)} caractères (confiance: {ocr_confidence:.3f})")
         
-        # Analyse IA optimisée
-        print("🤖 Début analyse IA optimisée...")
-        invoice_data = ai_analyzer.analyze_invoice_text(extracted_text)
+        # Analyse locale fondee sur les preuves OCR/RAG.
+        field_evidence = get_invoice_field_evidence(extracted_text)
+        rules = build_rule_candidate_pack(extracted_text)
+        invoice_data = ollama_analyzer.analyze_invoice_text(
+            extracted_text, field_evidence=field_evidence,
+            rule_candidates=rules.get("llm_candidates"),
+        ) or InvoiceData()
         
         # Ajuster le score de confiance global
         if invoice_data.confidence_score:
@@ -2797,10 +3239,6 @@ async def extract_invoice_data(
         # Ajouter le texte brut si demandé
         if include_raw_text:
             response_data['extracted_text'] = extracted_text
-        
-        # Ajouter le JSON Gemini si disponible et demandé
-        if return_gemini_json and 'gemini_result' in invoice_data.additional_data:
-            response_data['gemini_structured_data'] = invoice_data.additional_data['gemini_result']
         
         return OCRResponse(**response_data)
         
@@ -2927,6 +3365,8 @@ async def extract_invoice_with_gemma(
     include_raw_text: Optional[bool] = True,
     include_gemma_result: Optional[bool] = True
 ):
+    raise HTTPException(status_code=410, detail="Gemma a ete retire. Utilisez /agent/process-document avec model_choice=local.")
+
     """
     Extrait et analyse les données d'un document avec OCR + google/gemma-3-4b-it
     
@@ -3123,129 +3563,23 @@ async def verify_invoice(file: UploadFile = File(...)):
         # Sauvegarder le fichier temporairement
         file_path = await save_upload_file(file)
 
-        if is_pdf_file(file_path):
-            print("🔍 Début vérification PDF avec extraction texte...")
-            extracted_text, text_confidence, text_metadata = extract_document_text(file_path)
-            is_facture, confidence_score, keyword_details = classify_invoice_text(extracted_text)
-            if is_facture:
-                confidence_score = max(confidence_score, min(text_confidence, 0.95))
-            processing_time = time.time() - start_time
-
-            result = {
-                "success": True,
-                "is_invoice": is_facture,
-                "confidence_score": round(confidence_score, 3),
-                "detected_text": extracted_text[:500] if extracted_text else "",
-                "processing_time": round(processing_time, 3),
-                "analysis_method": "pdf_text_classification",
-                "analysis_details": {
-                    "text_extracted": bool(extracted_text.strip()),
-                    "keyword_details": keyword_details,
-                    "text_metadata": text_metadata,
-                }
-            }
-
-            print(f"✅ Vérification PDF terminée: {'FACTURE' if is_facture else 'PAS FACTURE'} (confiance: {confidence_score:.3f})")
-            return result
-
-        # Fallback OCR/texte si PaddleOCR layout n'est pas disponible pour les images
-        if paddle_pipeline is None:
-            print("⚠️ PaddleOCR indisponible, fallback vérification texte/OCR...")
-            extracted_text, text_confidence, text_metadata = extract_document_text(file_path)
-            is_facture, confidence_score, keyword_details = classify_invoice_text(extracted_text)
-            if is_facture:
-                confidence_score = max(confidence_score, min(text_confidence, 0.95))
-            processing_time = time.time() - start_time
-
-            return {
-                "success": True,
-                "is_invoice": is_facture,
-                "confidence_score": round(confidence_score, 3),
-                "detected_text": extracted_text[:500] if extracted_text else "",
-                "processing_time": round(processing_time, 3),
-                "analysis_method": "text_ocr_classification_fallback",
-                "analysis_details": {
-                    "text_extracted": bool(extracted_text.strip()),
-                    "keyword_details": keyword_details,
-                    "text_metadata": text_metadata,
-                }
-            }
-        
-        print("🔍 Début analyse de layout pour détection de facture...")
-        
-        # Exécuter l'analyse de layout
-        visual_results = paddle_pipeline.visual_predict(
-            input=file_path,
-            use_doc_orientation_classify=False,
-            use_doc_unwarping=False,
-            use_common_ocr=False,
-            use_seal_recognition=True,
-            use_table_recognition=False
-        )
-        
-        # Analyser les résultats pour détecter une facture
-        is_facture = False
-        confidence_score = 0.0
-        detected_text = ""
-        analysis_details = {}
-        
-        if (
-            isinstance(visual_results, list) and len(visual_results) > 0 and
-            "visual_info" in visual_results[0] and
-            "normal_text_dict" in visual_results[0]["visual_info"] and
-            "words in other_text" in visual_results[0]["visual_info"]["normal_text_dict"]
-        ):
-            text = visual_results[0]["visual_info"]['normal_text_dict']['words in other_text']
-            detected_text = str(text) if text else ""
-            
-            # Vérifier la présence du mot "facture"
-            if isinstance(text, str):
-                is_facture = 'facture' in text.lower()
-                if is_facture:
-                    confidence_score = 0.8  # Confiance élevée si mot trouvé directement
-            elif isinstance(text, list):
-                matching_items = [t for t in text if isinstance(t, str) and 'facture' in t.lower()]
-                is_facture = len(matching_items) > 0
-                if is_facture:
-                    confidence_score = 0.8
-            
-            # Analyser d'autres mots-clés liés aux factures
-            invoice_keywords = ['invoice', 'bill', 'receipt', 'total', 'montant', 'prix', 'tva', 'ht', 'ttc']
-            if detected_text:
-                keyword_matches = sum(1 for keyword in invoice_keywords if keyword.lower() in detected_text.lower())
-                if keyword_matches > 0:
-                    confidence_score = max(confidence_score, 0.3 + (keyword_matches * 0.1))
-                    if not is_facture and keyword_matches >= 3:
-                        is_facture = True
-                        confidence_score = 0.6
-            
-            analysis_details = {
-                "visual_results_available": True,
-                "text_extracted": bool(detected_text),
-                "keyword_matches": keyword_matches if 'keyword_matches' in locals() else 0,
-                "raw_visual_info": visual_results[0].get("visual_info", {}) if visual_results else {}
-            }
+        extracted_text, text_confidence, text_metadata = await run_in_threadpool(extract_document_text, file_path)
+        base_result = classify_invoice_text(extracted_text)
+        if paddle_pipeline is not None:
+            is_facture, confidence_score, details = await run_in_threadpool(
+                paddle_pipeline.classify, file_path, extracted_text, base_result,
+            )
         else:
-            analysis_details = {
-                "visual_results_available": False,
-                "error": "Impossible d'extraire les informations visuelles"
-            }
-        
-        processing_time = time.time() - start_time
-        
-        result = {
-            "success": True,
-            "is_invoice": is_facture,
+            is_facture, confidence_score, details = base_result
+            details["analysis_method"] = "text_ocr_classification_fallback"
+        return {
+            "success": True, "is_invoice": is_facture,
             "confidence_score": round(confidence_score, 3),
-            "detected_text": detected_text[:500] if detected_text else "",  # Limiter la taille
-            "processing_time": round(processing_time, 3),
-            "analysis_method": "paddleocr_layout_analysis",
-            "analysis_details": analysis_details
+            "detected_text": extracted_text[:500],
+            "processing_time": round(time.time() - start_time, 3),
+            "analysis_method": details["analysis_method"],
+            "analysis_details": {**details, "text_metadata": text_metadata},
         }
-        
-        print(f"✅ Vérification terminée: {'FACTURE' if is_facture else 'PAS FACTURE'} (confiance: {confidence_score:.3f})")
-        
-        return result
         
     except HTTPException:
         raise
@@ -3366,6 +3700,13 @@ async def extract_entities(file: UploadFile = File(...)):
                         }
                     }
                     entities.append(entity)
+
+        # L'ancien frontend appelle directement cette route; il doit recevoir
+        # les memes signatures que le pipeline agentique actuel.
+        signature_entities = detect_signature_objects(file_path)
+        for signature in signature_entities:
+            signature["id"] = len(entities)
+            entities.append(signature)
         
         processing_time = time.time() - start_time
         
@@ -3396,11 +3737,12 @@ async def extract_entities(file: UploadFile = File(...)):
             "entities": entities,
             "image_info": image_info,
             "entity_statistics": entity_stats,
-            "available_classes": list(classes.values()) if classes else [],
+            "available_classes": list(classes.values()) + (["signature"] if ENABLE_SIGNATURE_DETECTOR else []),
             "processing_time": round(processing_time, 3),
             "model_info": {
                 "type": "YOLO",
                 "model_path": YOLO_MODEL_PATH,
+                "signature_model": SIGNATURE_MODEL_ID if ENABLE_SIGNATURE_DETECTOR else None,
                 "confidence_threshold": 0.25,
                 "iou_threshold": 0.45
             }
@@ -3684,7 +4026,7 @@ async def extract_entities_with_ocr(
 @app.post("/invoices/process")
 async def process_invoice_for_data_entry(
     file: UploadFile = File(...),
-    model_choice: Optional[str] = "gemini",
+    model_choice: Optional[str] = "local",
     index_for_rag: Optional[bool] = True,
 ):
     """Traite une facture image/PDF et crée une fiche de saisie en brouillon."""
@@ -3731,16 +4073,18 @@ async def process_invoice_for_data_entry(
             elif model_choice == "fallback":
                 model_used = "fallback_regex"
             elif model_choice == "gemma":
-                invoice_data = get_gemma_analyzer().analyze_document(extracted_text)
-                model_used = "gemma"
+                # Compatibilite avec les anciens clients : Gemma est retire.
+                invoice_data = ollama_analyzer.analyze_invoice_text(extracted_text)
+                model_used = f"ollama:{ollama_analyzer.model_name}" if invoice_data else "fallback_regex"
             else:
-                invoice_data = ai_analyzer.analyze_invoice_text(extracted_text)
-                model_used = "gemini" if ai_analyzer.model else "fallback_regex"
+                invoice_data = ollama_analyzer.analyze_invoice_text(extracted_text)
+                model_used = f"ollama:{ollama_analyzer.model_name}" if invoice_data else "fallback_regex"
         except Exception as analysis_error:
             print(f"⚠️ Analyse IA indisponible, fallback regex: {analysis_error}")
             raw_data["analysis_error"] = str(analysis_error)
 
         normalized_data = normalize_invoice_data(invoice_data, extracted_text)
+        normalized_data.pop("_llm_abstained_fields", None)
         confidence_score = extraction_confidence
         if invoice_data and invoice_data.confidence_score:
             confidence_score = (extraction_confidence + invoice_data.confidence_score) / 2
@@ -4208,16 +4552,9 @@ async def rag_query(request: RAGQueryRequest):
             try:
                 generated = await run_in_threadpool(ollama_analyzer.answer_sources, request.question, result["sources"])
                 result.update(generated)
-                result["generation"] = {"status": "completed", "model": f"ollama:{ollama_analyzer.model_name}"}
+                result["generation"] = generated.get("generation") or {"status": "completed", "method": "llm", "model": f"ollama:{ollama_analyzer.model_name}"}
             except RuntimeError as error:
                 result["generation"] = {"status": "failed", "message": str(error), "model": f"ollama:{ollama_analyzer.model_name}"}
-        elif ai_analyzer.model and result["sources"]:
-            try:
-                generated = await run_in_threadpool(ai_analyzer.answer_sources, request.question, result["sources"])
-                result.update(generated)
-                result["generation"] = {"status": "completed", "model": ai_analyzer.model_name}
-            except RuntimeError as error:
-                result["generation"] = {"status": "failed", "message": str(error), "model": ai_analyzer.model_name}
         return {"success": True, **result}
     except Exception as e:
         print(f"❌ Erreur requête RAG: {e}")
