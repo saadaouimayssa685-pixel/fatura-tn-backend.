@@ -14,3 +14,11 @@ export async function apiFetch(input: string, init: RequestInit = {}) {
     throw new Error("Serveur inaccessible. Il peut être en cours de réveil ; réessayez dans une minute.");
   }
 }
+
+export async function fetchSourceDocument(input: string, signal?: AbortSignal) {
+  const response = await apiFetch(input, { signal, cache: "no-store" });
+  if (!response.ok) throw new Error("Document indisponible ou session expirée.");
+  const blob = await response.blob();
+  const url = URL.createObjectURL(blob);
+  return { url, release: () => URL.revokeObjectURL(url) };
+}

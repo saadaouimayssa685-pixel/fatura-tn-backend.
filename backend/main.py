@@ -18,6 +18,7 @@ from pydantic import BaseModel, Field
 from models import OCRResponse, InvoiceData
 from invoice_store import InvoiceStore
 from auth_database import connect_auth
+from workspace_access import WorkspaceAccessMiddleware, WorkspaceAccessPolicy
 from document_store import DocumentStore
 from fatura_dataset_store import FaturaDatasetStore
 from postgres_invoice_store import PostgresInvoiceStore
@@ -80,7 +81,8 @@ ALLOWED_ORIGINS = sorted(set(
 ))
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 REQUIRE_POSTGRES = os.getenv("REQUIRE_POSTGRES", "false").lower() == "true"
-SEED_DEMO_USERS = os.getenv("SEED_DEMO_USERS", "true").lower() == "true"
+WORKSPACE_ACCESS = WorkspaceAccessPolicy.from_environment(os.environ)
+SEED_DEMO_USERS = not WORKSPACE_ACCESS.required and os.getenv("SEED_DEMO_USERS", "true").lower() == "true"
 if REQUIRE_POSTGRES and not DATABASE_URL.startswith(("postgresql://", "postgres://")):
     raise RuntimeError("Configure DATABASE_URL with a persistent PostgreSQL database.")
 ENABLE_PADDLEOCR = os.getenv("ENABLE_PADDLEOCR", "false").strip().lower() in {"1", "true", "yes", "on"}
@@ -94,28 +96,9 @@ app = FastAPI(
     version="2.0.0"
 )
 
-# Configuration CORS
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
 # Créer le dossier de téléchargement
 @app.middleware("http")
 async def check_detection_availability(request, call_next):
-    if (REQUIRE_POSTGRES and request.method not in {"GET", "HEAD", "OPTIONS"}
-            and request.url.path not in {"/auth/signup", "/auth/login"}):
-        from starlette.concurrency import run_in_threadpool
-        user = await run_in_threadpool(user_from_authorization, request.headers.get("authorization"))
-        if not user:
-            headers = {}
-            origin = request.headers.get("origin")
-            if origin in ALLOWED_ORIGINS:
-                headers = {"Access-Control-Allow-Origin": origin, "Vary": "Origin"}
-            return JSONResponse(status_code=401, content={"detail": "Connexion requise."}, headers=headers)
     if request.url.path in {"/extract-entities", "/extract-entities-with-ocr"} and not ENABLE_YOLO:
         return JSONResponse(
             status_code=503,
@@ -287,6 +270,17 @@ def user_from_authorization(authorization: Optional[str]) -> Optional[dict]:
     if not authorization or not authorization.lower().startswith("bearer "):
         return None
     return get_user_from_token(authorization[7:].strip())
+
+
+# CORS is outermost so authentication errors and preflights remain readable.
+app.add_middleware(WorkspaceAccessMiddleware, policy=WORKSPACE_ACCESS, authenticate=user_from_authorization)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 init_auth_database()
@@ -2955,6 +2949,8 @@ async def root():
 
 @app.post("/auth/signup")
 async def signup(request: SignupRequest):
+    if WORKSPACE_ACCESS.required:
+        raise HTTPException(status_code=403, detail="Inscription publique desactivee. Contactez l'administrateur de cet espace.")
     email = normalize_email(request.email)
     if "@" not in email or "." not in email.split("@")[-1]:
         raise HTTPException(status_code=400, detail="Email professionnel invalide")
@@ -2998,6 +2994,9 @@ async def login(request: LoginRequest):
     if not row or not secrets.compare_digest(row[1], hash_password(request.password, row[2])):
         raise HTTPException(status_code=401, detail="Email ou mot de passe incorrect")
 
+    denial = WORKSPACE_ACCESS.denial({"email": email})
+    if denial:
+        raise HTTPException(status_code=denial[0], detail=denial[1])
     token = create_session(int(row[0]))
     user = get_user_from_token(token)
     return {"success": True, "token": token, "user": user}

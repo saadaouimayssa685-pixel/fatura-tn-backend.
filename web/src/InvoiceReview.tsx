@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from "react";
 import { ArrowLeft, Check, Download, Loader2, Minus, Plus, Save, Trash2, Undo2, X } from "lucide-react";
-import { API_BASE_URL, apiFetch } from "./api";
+import { API_BASE_URL, apiFetch, fetchSourceDocument } from "./api";
 import { FieldEvidence, PdfInvoicePreview, SourceHighlight } from "./InvoiceEvidence";
 import { correctionPatch, displayValue, numericFields, reviewGroups } from "./reviewData";
 import { detectionCategory, detectionScore, visibleDetections } from "./visualDetections";
@@ -24,6 +24,8 @@ export function InvoiceReview({ invoiceId, navigate }: { invoiceId: string; navi
   const [message, setMessage] = useState("");
   const [zoom, setZoom] = useState(100);
   const [imageError, setImageError] = useState(false);
+  const [sourceDocument, setSourceDocument] = useState<{ endpoint: string; url: string } | null>(null);
+  const [sourceError, setSourceError] = useState("");
   const confirmDialog = useRef<HTMLDialogElement>(null);
   const source = invoiceId.startsWith("dataset:") ? "dataset" : "processed";
   const original = invoice?.normalized_data || {};
@@ -32,7 +34,19 @@ export function InvoiceReview({ invoiceId, navigate }: { invoiceId: string; navi
   const raw = invoice?.raw_data || {};
   const proofs = raw.field_proofs || {};
   const isPdf = /pdf/i.test(invoice?.file_type || "") || /\.pdf$/i.test(invoice?.filename || "");
-  const fileUrl = `${API_BASE_URL}/invoices/catalog/download?${new URLSearchParams({ source, invoice_id: invoiceId, inline: "true" })}`;
+  const fileEndpoint = `${API_BASE_URL}/invoices/catalog/download?${new URLSearchParams({ source, invoice_id: invoiceId, inline: "true" })}`;
+  const fileUrl = sourceDocument?.endpoint === fileEndpoint ? sourceDocument.url : "";
+  useEffect(() => {
+    const controller = new AbortController();
+    let release: (() => void) | undefined;
+    setSourceError(""); setSourceDocument(null);
+    fetchSourceDocument(fileEndpoint, controller.signal).then(document => {
+      if (controller.signal.aborted) { document.release(); return; }
+      release = document.release;
+      setSourceDocument({ endpoint: fileEndpoint, url: document.url });
+    }).catch(e => { if (!controller.signal.aborted) setSourceError(e.message); });
+    return () => { controller.abort(); release?.(); };
+  }, [fileEndpoint]);
   const loadEvents = () => readOnly ? Promise.resolve() : request(`/database/validation-events?invoice_id=${encodeURIComponent(invoiceId)}`)
     .then(data => setEvents(data.events || [])).catch(() => setMessage("Historique des validations indisponible."));
   useEffect(() => {
@@ -85,8 +99,8 @@ export function InvoiceReview({ invoiceId, navigate }: { invoiceId: string; navi
     {message && <p role="status" className="review-notice">{message}</p>}
     <div className="review-workspace">
       <section className="review-document" aria-label="Document source" id="invoice-source-preview">
-        {isPdf ? <PdfInvoicePreview url={fileUrl} name={invoice.filename} highlight={highlight} /> : <>
-          <div className="invoice-pdf-toolbar"><button title="Réduire le zoom" aria-label="Réduire le zoom" disabled={zoom <= 75} onClick={() => setZoom(z => z - 25)}><Minus size={17} /></button><span>{zoom}%</span><button title="Agrandir le zoom" aria-label="Agrandir le zoom" disabled={zoom >= 200} onClick={() => setZoom(z => z + 25)}><Plus size={17} /></button><a href={fileUrl.replace("inline=true", "inline=false")} download title="Télécharger le document" aria-label="Télécharger le document"><Download size={17} /></a>{highlight && <button title="Effacer le surlignage" aria-label="Effacer le surlignage" onClick={() => setHighlight(null)}><X size={17} /></button>}</div>
+        {sourceError ? <p role="alert">{sourceError}</p> : !fileUrl ? <p role="status">Chargement du document…</p> : isPdf ? <PdfInvoicePreview url={fileUrl} name={invoice.filename} highlight={highlight} /> : <>
+          <div className="invoice-pdf-toolbar"><button title="Réduire le zoom" aria-label="Réduire le zoom" disabled={zoom <= 75} onClick={() => setZoom(z => z - 25)}><Minus size={17} /></button><span>{zoom}%</span><button title="Agrandir le zoom" aria-label="Agrandir le zoom" disabled={zoom >= 200} onClick={() => setZoom(z => z + 25)}><Plus size={17} /></button><a href={fileUrl} download={invoice.filename} title="Télécharger le document" aria-label="Télécharger le document"><Download size={17} /></a>{highlight && <button title="Effacer le surlignage" aria-label="Effacer le surlignage" onClick={() => setHighlight(null)}><X size={17} /></button>}</div>
           <div className="review-image-scroll">{imageError ? <p role="alert">Aperçu indisponible. <a href={fileUrl} target="_blank" rel="noreferrer">Ouvrir le document</a></p> : <div className="review-image-page" style={{ width: `${zoom}%` }}><img src={fileUrl} alt={`Facture ${invoice.filename}`} onError={() => setImageError(true)} /><SourceHighlight location={highlight} /></div>}</div>
         </>}
       </section>

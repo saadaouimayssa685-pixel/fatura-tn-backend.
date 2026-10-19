@@ -158,13 +158,14 @@ Aucune cle de fournisseur LLM ne doit utiliser un prefixe `VITE_`.
 
 ```powershell
 cd web
-node --test tests/reviewData.test.mjs
+node --test tests/reviewData.test.mjs tests/api.test.mjs
 npm run build
 ```
 
-La derniere verification locale du parcours UI a confirme **443 tests backend**
-et **11 tests frontend**, ainsi qu'un test correction/validation sur une copie
-SQLite isolee. Aucun nouvel appel OCR ou Groq n'a ete fait pour les captures.
+La derniere verification locale a confirme **464 tests backend** (dont 21 tests
+d'acces) et **15 tests frontend**, ainsi qu'une compilation frontend reussie.
+Le parcours correction/validation a aussi ete teste sur une copie SQLite isolee.
+Aucun nouvel appel OCR ou Groq n'a ete fait pour les captures ou la securisation.
 
 Une partie des tests backend depend de traces QA privees dans
 `backend/qa-results/`. Ces fichiers ne sont pas publies. La suite complete
@@ -173,7 +174,7 @@ Les tests independants des traces peuvent etre executes separement :
 
 ```powershell
 cd backend
-python -m unittest test_invoice_store test_extraction_guards test_groq_analyzer test_party_contacts
+python -m unittest test_invoice_store test_extraction_guards test_groq_analyzer test_party_contacts test_workspace_access
 ```
 
 Cette verification ne remplace pas un smoke test frais du service heberge.
@@ -185,9 +186,12 @@ Cette verification ne remplace pas un smoke test frais du service heberge.
 - `backend/Dockerfile.free` desactive PaddleOCR, YOLO et les embeddings
   Sentence Transformers : ce n'est pas l'equivalent du pipeline local.
 - Le controle public du 19 octobre 2026 a constate que `/database/stats`
-  repondait sans authentification. Les routes documentaires, les inscriptions
-  et les droits entre comptes doivent etre securises avant toute migration
-  de factures confidentielles.
+  repondait sans authentification. La branche de revue ajoute une protection
+  des lectures/ecritures, ferme l'inscription publique sur PostgreSQL et
+  exige `WORKSPACE_ALLOWED_EMAILS` pour les comptes autorises. Ces comptes
+  partagent un seul espace : ce n'est pas une isolation multi-entreprise.
+  Une configuration vide refuse l'acces. Cette correction doit encore etre
+  configuree et verifiee sur Render avant une migration de donnees privees.
 - Les fichiers locaux et bases SQLite ne doivent pas etre copies sur un
   disque ephemere en esperant qu'ils persistent.
 - La base PostgreSQL existante, son offre et sa politique de conservation
