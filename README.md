@@ -1,119 +1,114 @@
 # FATURA.tn
 
-Application d'aide a la saisie des factures : extraction documentee, preuves
-consultables et validation humaine. Le resultat automatique reste un brouillon
-jusqu'a sa verification.
+Application web d'aide a la saisie et a la verification des factures.
+FATURA.tn associe les donnees extraites a leurs preuves documentaires et permet
+de les corriger avant validation humaine.
 
-## Demonstration : resultats reels
-
-Captures de l'application locale prises le 19 octobre 2026 sur la facture de
-test `00158`, avec autorisation de publication. Il s'agit des donnees deja
-enregistrees, pas d'une nouvelle execution OCR/LLM ni d'un benchmark.
-
-Le nom du fichier est `facture_00158`, mais le numero imprime est **00633**.
-
-![Resultats de la facture et surlignage du fournisseur](docs/screenshots/01-resultats-facture.jpg)
-
-| Resultat observe | Valeur |
-| --- | --- |
-| Numero de facture | 00633 |
-| Date | 28-11-2019 |
-| Fournisseur | BEN ABDELKADER |
-| Articles retrouves | 2 |
-| Prix unitaires | 6,000 et 6,000, en TTC |
-| Timbre | 0,600 |
-| Total TTC imprime | 12,600 |
-| Paiement | Especes |
-| HT et TVA | Non renseignes : ne pas les inventer |
-
-La capture conserve volontairement l'etat **A verifier**, les champs vides et
-les imperfections OCR. Par exemple, le nom client contient encore la graphie
-OCR `BRIDGE IMMOBILERE`. Une capture de resultat n'est pas une certification
-de l'exactitude de tous les champs.
-
-### Articles
-
-Le formulaire conserve les references, quantites, prix et la base HT/TTC.
-
-![Premier article et edition des lignes](docs/screenshots/02-articles.jpg)
-
-![Second article avec sa reference et son montant](docs/screenshots/03-second-article.jpg)
-
-### Preuves et surlignage
-
-Un clic ouvre le passage source. Lorsque des coordonnees sont disponibles,
-le champ peut etre localise sur l'image ou le PDF. Une correction humaine
-reste distinguee de la preuve de la valeur originale.
-
-![Fenetre de preuve documentaire](docs/screenshots/04-preuve-rag.jpg)
-
-![Total TTC surligne sur la facture source](docs/screenshots/05-montants-highlight.jpg)
+![Facture et champs extraits](docs/screenshots/01-resultats-facture.jpg)
 
 ## Fonctionnalites
 
-- Connexion et sessions backend.
-- Import d'images/PDF, classification et creation d'un brouillon.
-- Champs fournisseur/client, identifiants, montants et articles editables.
-- Enregistrement, annulation, confirmation de validation et historique.
-- Preuves par champ, apercu image/PDF, surlignage et export JSON.
-- Tableau de bord et fournisseurs issus des donnees enregistrees.
-- Fatura Assistant sous forme de panneau de conversation.
+- Authentification et sessions utilisateur.
+- Import de factures au format image ou PDF.
+- Classification documentaire et extraction des champs fournisseur/client.
+- Recuperation des references, dates, montants, taxes et articles.
+- Preuves par champ et surlignage lorsque les coordonnees existent.
+- Correction, enregistrement du brouillon, validation humaine et historique.
+- Tableau de bord, catalogue des factures et liste des fournisseurs.
+- Apercu du document, telechargement authentifie et export JSON.
+- Fatura Assistant en panneau de conversation.
 
-La reinitialisation du mot de passe par email n'est pas configuree.
-Les scores de detection ne certifient pas l'authenticite d'une facture.
+Une extraction automatique reste un brouillon a verifier. Les detections
+visuelles ne constituent pas une certification d'authenticite.
 
-## Pipeline actuel
+## Demonstration
 
-```text
-Document image/PDF
-  -> OCR / texte PDF et structure des tableaux
-  -> classification
-  -> retrieval des preuves
-  -> extraction LLM
-  -> grounding / mapping
-  -> regles et validation financiere
-  -> brouillon corrige et valide par un humain
-```
+Les captures montrent le resultat enregistre de la facture de demonstration
+`00158`, publie avec autorisation. Le numero imprime est **00633**, distinct
+du nom du fichier.
 
-| Couche | Technologies / configuration |
+| Champ | Resultat |
 | --- | --- |
-| Interface actuelle | React 19, TypeScript, Vite, Lucide, Recharts, PDF.js |
-| API | Python, FastAPI |
-| OCR local valide | PaddleOCR et reconstruction spatiale; Tesseract / texte PDF selon configuration |
-| Detection visuelle | Ultralytics / YOLO, selon les poids configures |
-| RAG d'extraction | Chunking legacy, BM25 + all-MiniLM-L6-v2 + RRF |
-| Options conservees | Chunking layout, BGE-M3 en haute qualite |
-| Extraction | Groq GPT-OSS-120B; adaptateur Ollama configurable |
-| Stockage local | SQLite et documents sur disque |
-| Stockage heberge | Adaptateurs PostgreSQL / JSONB et fichiers BYTEA |
+| Numero | 00633 |
+| Date | 28-11-2019 |
+| Fournisseur | BEN ABDELKADER |
+| Articles | 2 |
+| Prix unitaires TTC | 6,000 et 6,000 TND |
+| Timbre | 0,600 TND |
+| Total TTC imprime | 12,600 TND |
+| Paiement | Especes |
+| HT et TVA | Non renseignes dans le resultat |
 
-Les valeurs sans preuve ne doivent pas etre fabriquees. Les controles financiers
-signalent la coherence sans remplacer un montant imprime par un calcul.
-Les quotas du fournisseur LLM peuvent interrompre une extraction.
+### Articles
 
-## Organisation du depot
+![Premier article](docs/screenshots/02-articles.jpg)
+
+![Second article](docs/screenshots/03-second-article.jpg)
+
+### Preuves documentaires
+
+Un clic ouvre le passage utilise pour l'extraction. Le surlignage permet de
+retrouver sa position sur l'image ou le PDF. Une valeur corrigee manuellement
+reste distinguee de la preuve de la valeur originale.
+
+![Passage source](docs/screenshots/04-preuve-rag.jpg)
+
+![Total TTC surligne](docs/screenshots/05-montants-highlight.jpg)
+
+Ces captures conservent l'etat **A verifier**, les champs vides et les erreurs
+OCR eventuelles, notamment la graphie `BRIDGE IMMOBILERE` du nom client.
+Elles illustrent le parcours de verification, pas une extraction parfaite.
+
+## Architecture
 
 ```text
-backend/              API, OCR, retrieval, grounding, stores et tests
-web/                  Interface React/Vite actuelle
-models/extraction/    Poids YOLO du projet
-assets/               Ressources backend
-docs/                 Notes de deploiement et captures
-data/                 Donnees locales ignorees par Git
+Image / PDF
+    -> OCR et structure des tableaux
+    -> Classification
+    -> Recherche des preuves documentaires
+    -> Extraction LLM
+    -> Grounding et mapping
+    -> Regles metier et validation financiere
+    -> Correction et validation humaines
 ```
 
-`web/` est une copie versionnee de l'interface locale `Desktop/Front`.
-L'ancien dossier Next.js `frontend/` present sur la machine n'est pas
-l'interface actuelle et n'est pas ajoute dans cette mise a jour.
+| Couche | Technologies |
+| --- | --- |
+| Frontend | React 19, TypeScript, Vite, Lucide, Recharts, PDF.js |
+| Backend | Python, FastAPI |
+| OCR | PaddleOCR, Tesseract et extraction de texte PDF selon configuration |
+| Detection visuelle | Ultralytics / YOLO et poids configures |
+| RAG d'extraction | Chunking legacy, BM25, all-MiniLM-L6-v2, RRF |
+| Options RAG | Chunking layout, BGE-M3 en mode haute qualite |
+| LLM | Groq GPT-OSS-120B, adaptateur Ollama configurable |
+| Stockage local | SQLite et documents sur disque |
+| Stockage heberge | PostgreSQL, JSONB et fichiers BYTEA |
 
-## Demarrage local
+Les controles financiers signalent les incoherences sans remplacer les
+montants imprimes par des montants calcules. Les champs insuffisamment
+prouves doivent rester vides ou etre signales pour verification.
+
+## Contenu du depot
+
+```text
+backend/              API, OCR, extraction, preuves et stockage
+web/                  Interface React / Vite
+models/extraction/    Poids YOLO inclus dans le projet
+assets/               Ressources backend
+docs/                 Configuration, hebergement et captures
+```
+
+Le depot contient le code applicatif complet. Les bases, fichiers importes,
+cles API, journaux, scripts de test et outils d'experimentation sont conserves
+hors du contenu publie. Certains poids de modeles doivent etre installes
+separement selon la configuration choisie.
+
+## Installation locale
 
 ### Backend
 
-Installer Python et les dependances systeme des moteurs OCR utilises.
-Les poids des modeles doivent etre disponibles; ils ne sont pas tous inclus
-dans le depot. Les versions de dependances doivent etre verifiees pour
-l'environnement cible, notamment Paddle et PyTorch CPU.
+Installer Python, les dependances systeme OCR et les poids des modeles utilises.
+Verifier la compatibilite de Paddle et PyTorch avec l'environnement cible.
 
 ```powershell
 cd backend
@@ -123,17 +118,16 @@ pip install -r requirements.txt
 Copy-Item .env.example .env
 ```
 
-Configurer `.env` sans jamais le committer :
+Configurer le fichier `.env` :
 
-- pour SQLite local : laisser `DATABASE_URL` vide et `REQUIRE_POSTGRES=false`;
-- pour Groq : `INVOICE_LLM_PROVIDER=groq` et une cle serveur `GROQ_API_KEY`;
-- conserver `RAG_CHUNKING_MODE=legacy` et `RAG_EMBEDDING_MODEL=minilm`;
-- pour le pipeline Paddle : `ENABLE_PADDLEOCR=true` et `OCR_TEXT_ENGINE=paddle`;
-- adapter les chemins de modeles et de stockage a la machine.
+- SQLite local : `DATABASE_URL` vide et `REQUIRE_POSTGRES=false`.
+- PaddleOCR : `ENABLE_PADDLEOCR=true` et `OCR_TEXT_ENGINE=paddle`.
+- Retrieval : `RAG_CHUNKING_MODE=legacy` et `RAG_EMBEDDING_MODEL=minilm`.
+- Groq : `INVOICE_LLM_PROVIDER=groq` et la cle serveur `GROQ_API_KEY`.
+- Adapter les chemins des modeles et du stockage a la machine.
 
-Le fichier exemple est un gabarit, pas une copie de la configuration privee
-du poste. Ne pas supposer qu'un modele local est pret simplement parce que
-son nom est configure.
+Le fichier `.env.example` est un gabarit : il ne contient pas les secrets ni
+la configuration privee du poste. Ne jamais publier le fichier `.env`.
 
 ```powershell
 python -m uvicorn main:app --host 127.0.0.1 --port 8002
@@ -150,65 +144,40 @@ Copy-Item .env.example .env.local
 npm run dev -- --port 5176 --strictPort
 ```
 
-Ouvrir [Fatura en local](http://127.0.0.1:5176).
-`VITE_API_BASE_URL` doit pointer sur `http://127.0.0.1:8002` en local.
-Aucune cle de fournisseur LLM ne doit utiliser un prefixe `VITE_`.
+Ouvrir [FATURA.tn en local](http://127.0.0.1:5176).
+La variable `VITE_API_BASE_URL` doit pointer vers `http://127.0.0.1:8002`.
+Aucune cle LLM ne doit etre exposee dans une variable `VITE_`.
 
-## Verifications
+Pour compiler l'interface : `npm run build` depuis `web/`.
 
-```powershell
-cd web
-node --test tests/reviewData.test.mjs tests/api.test.mjs
-npm run build
-```
+## Hebergement et securite
 
-La derniere verification locale a confirme **464 tests backend** (dont 21 tests
-d'acces) et **15 tests frontend**, ainsi qu'une compilation frontend reussie.
-Le parcours correction/validation a aussi ete teste sur une copie SQLite isolee.
-Aucun nouvel appel OCR ou Groq n'a ete fait pour les captures ou la securisation.
+- Vercel : dossier racine `web`, compilation Vite, sortie `dist`.
+- Backend : service FastAPI et base PostgreSQL persistante.
+- `WORKSPACE_ALLOWED_EMAILS` definit les comptes existants autorises a acceder
+  a l'espace partage. Une liste vide refuse l'acces.
+- En mode heberge PostgreSQL, l'inscription publique et les comptes de
+  demonstration sont desactives. Les routes de donnees exigent une session.
+- Les comptes autorises partagent une seule base : l'application ne propose
+  pas d'isolation multi-entreprise.
+- Les secrets sont configures dans les consoles d'hebergement, jamais dans Git.
 
-Une partie des tests backend depend de traces QA privees dans
-`backend/qa-results/`. Ces fichiers ne sont pas publies. La suite complete
-n'est donc pas reproductible telle quelle depuis un clone sans ces fixtures.
-Les tests independants des traces peuvent etre executes separement :
+Le profil `backend/Dockerfile.free` desactive PaddleOCR, YOLO et les embeddings
+Sentence Transformers. Il n'est pas equivalent au pipeline local complet.
+La version du depot doit etre deployee et verifiee separement : sa publication
+sur GitHub ne garantit pas que le site public execute cette version.
 
-```powershell
-cd backend
-python -m unittest test_invoice_store test_extraction_guards test_groq_analyzer test_party_contacts test_workspace_access
-```
-
-Cette verification ne remplace pas un smoke test frais du service heberge.
-
-## Hebergement : limites importantes
-
-- L'interface publique existante est sur Vercel.
-- Le backend Render actuellement observe utilise un profil allege.
-- `backend/Dockerfile.free` desactive PaddleOCR, YOLO et les embeddings
-  Sentence Transformers : ce n'est pas l'equivalent du pipeline local.
-- Le controle public du 19 octobre 2026 a constate que `/database/stats`
-  repondait sans authentification. La branche de revue ajoute une protection
-  des lectures/ecritures, ferme l'inscription publique sur PostgreSQL et
-  exige `WORKSPACE_ALLOWED_EMAILS` pour les comptes autorises. Ces comptes
-  partagent un seul espace : ce n'est pas une isolation multi-entreprise.
-  Une configuration vide refuse l'acces. Cette correction doit encore etre
-  configuree et verifiee sur Render avant une migration de donnees privees.
-- Les fichiers locaux et bases SQLite ne doivent pas etre copies sur un
-  disque ephemere en esperant qu'ils persistent.
-- La base PostgreSQL existante, son offre et sa politique de conservation
-  doivent etre verifiees dans les tableaux de bord des fournisseurs.
-- Aucun transfert de base, changement d'offre ou redeploiement n'est realise
-  par cette mise a jour documentaire.
-
-Voir le [guide de deploiement](docs/RENDER_FREE.md) et les
+Voir le [guide Render](docs/RENDER_FREE.md) et les
 [limites du stockage heberge](backend/FILE_STORAGE.md).
 
-## Donnees et secrets
+## Limites
 
-Les bases SQLite, comptes, sessions, journaux, cles API, archives du dataset
-et traces QA restent locaux. Seules les captures de la facture de test
-autorisee sont ajoutees a la documentation. Le consentement pour ces captures
-ne vaut pas autorisation de publier les autres factures.
-
-Les regles `.gitignore`, `.dockerignore` et `.vercelignore` ne retirent pas
-un secret deja present dans l'historique Git. Inspecter le contenu avant
-publication et faire tourner toute cle exposee.
+- Une verification humaine reste necessaire, notamment pour les scans peu
+  lisibles, les tableaux ambigus et les identifiants incomplets.
+- Les quotas et la disponibilite du fournisseur LLM peuvent interrompre
+  l'analyse.
+- La reinitialisation du mot de passe par email n'est pas configuree.
+- Les donnees locales ne sont pas automatiquement transferees vers le service
+  heberge. Une migration doit inclure les documents et l'historique.
+- Les captures autorisees ne constituent pas une autorisation de publier
+  d'autres factures ou des donnees privees.

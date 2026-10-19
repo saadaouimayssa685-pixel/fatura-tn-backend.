@@ -78,17 +78,15 @@ authorization, persistence across restarts, or equivalence with the local app.
 The access-control changes on the review branch are not evidence that the
 currently hosted instance is already secured. Repeat the checks after release.
 
-## Offline access-control checks
+## Access-control verification
 
-```powershell
-cd backend
-python -m unittest test_workspace_access -v
-```
+Development tests and QA tools are kept privately on the development machine,
+not distributed with this application source. They use in-memory handlers and
+sessions, never production accounts or documents. The hosted access checks in
+the checklist above are still required after deployment.
 
-These tests use in-memory handlers and sessions, never production accounts or
-documents. They cover every declared API path without OCR/LLM calls. Browser
-source previews fetch images/PDFs with a Bearer header and create temporary
-blob URLs; session tokens are not included in download URLs.
+Browser source previews fetch images/PDFs with a Bearer header and create
+temporary blob URLs; session tokens are not included in download URLs.
 
 Provider references (recheck before changing plans):
 - https://render.com/docs/free

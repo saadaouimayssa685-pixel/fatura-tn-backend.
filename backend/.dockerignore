@@ -61,6 +61,7 @@ logs/
 tests/
 test_*.py
 *_test.py
+qa_*.py
 
 # Environment files
 .env.local

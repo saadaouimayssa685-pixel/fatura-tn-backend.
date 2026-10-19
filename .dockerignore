@@ -19,5 +19,8 @@ frontend
 **/*.key
 **/.pytest_cache
 backend/qa-*.json
+backend/qa_*.py
+backend/test_*.py
+backend/tests
 web
 docs/screenshots
